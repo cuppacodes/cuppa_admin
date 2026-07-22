@@ -1,0 +1,32 @@
+return {
+    prefix = 'cc',
+
+    -- Optional Discord webhook for ban logging (set to nil to disable)
+    banWebhook = nil,
+    -- banWebhook = 'https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN',
+
+    perms = {
+        list = 'admin',
+        kick = 'admin',
+        ban = 'admin',
+        unban = 'admin',
+        heal = 'mod',
+        kill = 'mod',
+        revive = 'mod',
+        freeze = 'mod',
+        unfreeze = 'mod',
+        goto_cmd = 'mod',
+        bring = 'mod',
+        vehicle = 'admin',
+        fix = 'admin',
+        dv = 'admin',
+        giveitem = 'admin',
+        setjob = 'admin',
+        setgang = 'admin',
+        givecash = 'admin',
+        givebank = 'admin',
+        armor = 'admin',
+        setmodel = 'admin',
+        noclip = 'mod',
+    },
+}
