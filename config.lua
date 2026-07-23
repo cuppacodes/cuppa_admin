@@ -28,5 +28,8 @@ return {
         armor = 'admin',
         setmodel = 'admin',
         noclip = 'mod',
+        tp = 'mod',
+        godmode = 'admin',
+        visible = 'admin',
     },
 }

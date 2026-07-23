@@ -1,4 +1,7 @@
 local noclip = false
+local godmode = false
+local hiddenFrom = {}
+local iAmHidden = false
 
 RegisterNetEvent('cuppa_admin:client:kill', function()
     SetEntityHealth(cache.ped, 0)
@@ -21,6 +24,46 @@ RegisterNetEvent('cuppa_admin:client:setModel', function(model)
     lib.requestModel(model)
     SetPlayerModel(cache.playerId, model)
     SetModelAsNoLongerNeeded(model)
+end)
+
+RegisterNetEvent('cuppa_admin:client:godmode', function()
+    godmode = not godmode
+    SetEntityInvincible(cache.ped, godmode)
+    if godmode then
+        CreateThread(function()
+            while godmode do
+                Wait(0)
+                SetEntityInvincible(cache.ped, true)
+                SetPlayerInvisibleLocally(cache.playerId, false)
+            end
+        end)
+    end
+end)
+
+RegisterNetEvent('cuppa_admin:client:visibleGlobal', function(requestor)
+    if cache.playerId == requestor then return end
+    iAmHidden = not iAmHidden or nil
+end)
+
+RegisterNetEvent('cuppa_admin:client:visible', function(target)
+    hiddenFrom[target] = not hiddenFrom[target] or nil
+end)
+
+CreateThread(function()
+    while true do
+        Wait(0)
+        local myId = cache.playerId
+        local players = GetActivePlayers()
+        for _, playerIdx in ipairs(players) do
+            local serverId = GetPlayerServerId(playerIdx)
+            if serverId ~= myId and (iAmHidden or hiddenFrom[serverId]) then
+                local targetPed = GetPlayerPed(playerIdx)
+                if targetPed and targetPed ~= 0 then
+                    SetEntityVisible(targetPed, false, false)
+                end
+            end
+        end
+    end
 end)
 
 RegisterNetEvent('cuppa_admin:client:noclip', function()

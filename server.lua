@@ -1,6 +1,39 @@
 local config = require 'config'
 local isFrozen = {}
 
+-- Detect which medical resource is available
+local medicalResource = nil
+if GetResourceState('wasabi_ambulance_v2') == 'started' then
+    medicalResource = 'wasabi'
+elseif GetResourceState('qbx_medical') == 'started' then
+    medicalResource = 'qbx'
+end
+
+local function revivePlayer(target)
+    if medicalResource == 'wasabi' then
+        exports.wasabi_ambulance_v2:RevivePlayer(target)
+    elseif medicalResource == 'qbx' then
+        exports.qbx_medical:Revive(target)
+    else
+        print('^1[cuppa_admin] No medical resource found (wasabi_ambulance_v2 or qbx_medical)^0')
+    end
+end
+
+local function healPlayer(target)
+    if medicalResource == 'wasabi' then
+        exports.wasabi_ambulance_v2:ApplyHeal(target, {
+            health = 200,
+            injuries = { { type = 'all', limb = 'all' } },
+            limbHealth = 100,
+            resetNeeds = true
+        })
+    elseif medicalResource == 'qbx' then
+        exports.qbx_medical:Heal(target)
+    else
+        print('^1[cuppa_admin] No medical resource found (wasabi_ambulance_v2 or qbx_medical)^0')
+    end
+end
+
 local function hasPermission(source, perm)
     if source == 0 then return true end
     local requiredPerm = config.perms[perm]
@@ -96,7 +129,7 @@ local function showHelp(source)
         {'cc ban <id> [reason] [dur]',     'Ban a player (dur: 24h/7d/1m/1y)'},
         {'cc unban <banid>',                'Unban a player by ban ID'},
         {'cc heal <id>',                    'Fully heal a player + full armor'},
-        {'cc kill <id>',                    'Kill a player'},
+        {'cc kill [id]',                    'Kill a player (or self)'},
         {'cc revive <id>',                  'Revive a player'},
         {'cc freeze <id>',                  'Freeze a player in place'},
         {'cc unfreeze <id>',                'Unfreeze a player'},
@@ -104,7 +137,7 @@ local function showHelp(source)
         {'cc bring <id>',                   'Bring a player to you (in-game only)'},
         {'cc vehicle <model> [id]',         'Spawn a vehicle for a player'},
         {'cc fix [id]',                     'Fix a player\'s vehicle'},
-        {'cc dv [id]',                      'Delete a player\'s vehicle'},
+        {'cc dv [id] [radius]',             'Delete vehicle(s) near a player (meters)'},
         {'cc giveitem <id> <item> [n]',     'Give items to a player'},
         {'cc setjob <id> <job> [grade]',    'Set a player\'s job'},
         {'cc setgang <id> <gang> [grade]',  'Set a player\'s gang'},
@@ -113,6 +146,9 @@ local function showHelp(source)
         {'cc armor <id> [amount]',          'Set player armor (0-100)'},
         {'cc setmodel <model> [id]',        'Change a player\'s ped model'},
         {'cc noclip [id]',                  'Toggle noclip for a player'},
+        {'cc tp <id> <id>',                 'Teleport player A to player B'},
+        {'cc godmode [id]',                 'Toggle godmode for a player'},
+        {'cc visible [id]',                 'Toggle player visible/invisible (on your screen)'},
     }
     print('^2[cuppa_admin] Available Commands:^0')
     for _, cmd in ipairs(cmds) do
@@ -205,7 +241,7 @@ RegisterCommand(config.prefix, function(source, args)
         local target = getTarget(source, args[2])
         if not target then return end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        exports.qbx_medical:Heal(target)
+        healPlayer(target)
         SetPedArmour(GetPlayerPed(target), 100)
         notify(source, 'Healed player ' .. target, 'success')
 
@@ -222,7 +258,7 @@ RegisterCommand(config.prefix, function(source, args)
         local target = getTarget(source, args[2])
         if not target then return end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        exports.qbx_medical:Revive(target)
+        revivePlayer(target)
         notify(source, 'Revived player ' .. target, 'success')
 
     elseif cmd == 'freeze' then
@@ -297,8 +333,23 @@ RegisterCommand(config.prefix, function(source, args)
         local target = getTarget(source, args[2]) or source
         if target == 0 then return notify(source, 'Console requires a player ID', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        TriggerClientEvent('cuppa_admin:client:deleteVehicle', target)
-        notify(source, 'Deleted vehicle for player ' .. target, 'success')
+        local radius = tonumber(args[3])
+        if radius then
+            local coords = GetEntityCoords(GetPlayerPed(target))
+            local vehicles = GetGamePool('CVehicle')
+            local count = 0
+            for _, vehicle in ipairs(vehicles) do
+                local vCoords = GetEntityCoords(vehicle)
+                if #(coords - vCoords) <= radius then
+                    DeleteEntity(vehicle)
+                    count = count + 1
+                end
+            end
+            notify(source, 'Deleted ' .. count .. ' vehicles within ' .. radius .. 'm of player ' .. target, 'success')
+        else
+            TriggerClientEvent('cuppa_admin:client:deleteVehicle', target)
+            notify(source, 'Deleted vehicle for player ' .. target, 'success')
+        end
 
     elseif cmd == 'giveitem' then
         if not hasPermission(source, 'giveitem') then return notify(source, 'No permission', 'error') end
@@ -381,6 +432,72 @@ RegisterCommand(config.prefix, function(source, args)
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
         TriggerClientEvent('cuppa_admin:client:noclip', target)
         notify(source, 'Toggled noclip for player ' .. target, 'success')
+
+    elseif cmd == 'tp' then
+        if source == 0 then
+            if not hasPermission(source, 'tp') then return notify(source, 'No permission', 'error') end
+            local targetA = tonumber(args[2])
+            local targetB = tonumber(args[3])
+            if not targetA or not targetB then return notify(source, 'Usage: cc tp <id> <id>', 'error') end
+            if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player ' .. targetA .. ' not found', 'error') end
+            if not exports.qbx_core:GetPlayer(targetB) then return notify(source, 'Player ' .. targetB .. ' not found', 'error') end
+            local coords = GetEntityCoords(GetPlayerPed(targetB))
+            local targetBucket = GetPlayerRoutingBucket(targetB)
+            if GetPlayerRoutingBucket(targetA) ~= targetBucket then
+                SetPlayerRoutingBucket(targetA, targetBucket)
+            end
+            SetEntityCoords(GetPlayerPed(targetA), coords.x, coords.y, coords.z, false, false, false, false)
+            notify(source, 'Teleported player ' .. targetA .. ' to player ' .. targetB, 'success')
+        else
+            if not hasPermission(source, 'tp') then return notify(source, 'No permission', 'error') end
+            local targetA = tonumber(args[2])
+            local targetB = tonumber(args[3])
+            -- cc tp <id> — teleport self to player
+            if targetA and not targetB then
+                if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player not found', 'error') end
+                local coords = GetEntityCoords(GetPlayerPed(targetA))
+                local targetBucket = GetPlayerRoutingBucket(targetA)
+                if GetPlayerRoutingBucket(source) ~= targetBucket then
+                    SetPlayerRoutingBucket(source, targetBucket)
+                end
+                SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
+                notify(source, 'Teleported to player ' .. targetA, 'success')
+            -- cc tp <id> <id> — teleport player A to player B
+            elseif targetA and targetB then
+                if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player ' .. targetA .. ' not found', 'error') end
+                if not exports.qbx_core:GetPlayer(targetB) then return notify(source, 'Player ' .. targetB .. ' not found', 'error') end
+                local coords = GetEntityCoords(GetPlayerPed(targetB))
+                local targetBucket = GetPlayerRoutingBucket(targetB)
+                if GetPlayerRoutingBucket(targetA) ~= targetBucket then
+                    SetPlayerRoutingBucket(targetA, targetBucket)
+                end
+                SetEntityCoords(GetPlayerPed(targetA), coords.x, coords.y, coords.z, false, false, false, false)
+                notify(source, 'Teleported player ' .. targetA .. ' to player ' .. targetB, 'success')
+            else
+                return notify(source, 'Usage: cc tp <id> [id]', 'error')
+            end
+        end
+
+    elseif cmd == 'godmode' then
+        if not hasPermission(source, 'godmode') then return notify(source, 'No permission', 'error') end
+        local target = getTarget(source, args[2]) or (source == 0 and nil or source)
+        if not target then return notify(source, 'Usage: cc godmode [id]', 'error') end
+        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        TriggerClientEvent('cuppa_admin:client:godmode', target)
+        notify(source, 'Toggled godmode for player ' .. target, 'success')
+
+    elseif cmd == 'visible' then
+        if not hasPermission(source, 'visible') then return notify(source, 'No permission', 'error') end
+        if source == 0 then return notify(source, 'Cannot use visible from console', 'error') end
+        local target = tonumber(args[2])
+        if not target then
+            -- No args: toggle my own visibility to all players
+            TriggerClientEvent('cuppa_admin:client:visibleGlobal', -1, source)
+        else
+            if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+            -- With args: toggle player visibility on my screen
+            TriggerClientEvent('cuppa_admin:client:visible', source, target)
+        end
 
     else
         notify(source, 'Unknown command: cc ' .. cmd .. ' — run "cc help" for commands', 'error')
