@@ -1,0 +1,13 @@
+{
+  "name": "cuppa-admin-discord",
+  "version": "1.0.0",
+  "description": "Discord bot for cuppa_admin FiveM resource",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "rcon-client": "^4.2.4"
+  }
+}

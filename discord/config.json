@@ -1,0 +1,15 @@
+{
+  "fivem": {
+    "host": "127.0.0.1",
+    "port": 30120,
+    "rconPassword": "YOUR_RCON_PASSWORD"
+  },
+  "discord": {
+    "token": "YOUR_BOT_TOKEN",
+    "prefix": "!cc",
+    "adminChannelId": "",
+    "auditChannelId": "",
+    "adminRoles": ["admin", "mod"],
+    "rateLimitMs": 1000
+  }
+}
