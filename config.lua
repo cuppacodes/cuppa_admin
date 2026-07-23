@@ -31,5 +31,7 @@ return {
         tp = 'mod',
         godmode = 'admin',
         visible = 'admin',
+        hide = 'mod',
+        bucket = 'mod',
     },
 }

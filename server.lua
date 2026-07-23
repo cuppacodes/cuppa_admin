@@ -1,5 +1,14 @@
 local config = require 'config'
 local isFrozen = {}
+local hiddenState = {} -- [source] = exceptionServerId
+local bucketState = {} -- [source] = bucketId
+local bucketMembers = {} -- [bucketId] = {[source] = true, ...}
+local bucketAdmin = {} -- [bucketId] = adminSource
+local bucketLicenses = {} -- [license] = bucketId (persists across disconnects)
+
+local function getLicense(source)
+    return GetPlayerIdentifierByType(source, 'license')
+end
 
 -- Detect which medical resource is available
 local medicalResource = nil
@@ -149,6 +158,14 @@ local function showHelp(source)
         {'cc tp <id> <id>',                 'Teleport player A to player B'},
         {'cc godmode [id]',                 'Toggle godmode for a player'},
         {'cc visible [id]',                 'Toggle player visible/invisible (on your screen)'},
+        {'cc hide <id>',                    'Hide yourself from everyone except <id>'},
+        {'cc show',                         'Restore normal visibility (undo cc hide)'},
+        {'cc bucket add [id...]',           'Create a bucket (optionally with players)'},
+        {'cc bucket leave',                 'Leave your current bucket'},
+        {'cc bucket kick <id>',             'Kick a player from your bucket'},
+        {'cc bucket rm <bucket id>',        'Destroy a bucket, return all members to main world'},
+        {'cc bucket status',                'Show all active buckets with members'},
+        {'cc bucket wipe',                  'Destroy ALL buckets, everyone back to main world'},
     }
     print('^2[cuppa_admin] Available Commands:^0')
     for _, cmd in ipairs(cmds) do
@@ -499,7 +516,223 @@ RegisterCommand(config.prefix, function(source, args)
             TriggerClientEvent('cuppa_admin:client:visible', source, target)
         end
 
+    elseif cmd == 'hide' then
+        if not hasPermission(source, 'hide') then return notify(source, 'No permission', 'error') end
+        if source == 0 then return notify(source, 'Cannot use hide from console', 'error') end
+        local exceptionId = tonumber(args[1])
+        if not exceptionId then return notify(source, 'Usage: cc hide <id>', 'error') end
+        if not exports.qbx_core:GetPlayer(exceptionId) then return notify(source, 'Player not found', 'error') end
+        if exceptionId == source then return notify(source, 'Cannot hide from yourself', 'error') end
+
+        hiddenState[source] = exceptionId
+
+        local players = exports.qbx_core:GetQBPlayers()
+        for id, _ in pairs(players) do
+            local idNum = tonumber(id)
+            if idNum ~= source and idNum ~= exceptionId then
+                TriggerClientEvent('cuppa_admin:client:concealPlayer', idNum, source)
+            elseif idNum == exceptionId then
+                TriggerClientEvent('cuppa_admin:client:showPlayer', idNum, source)
+            end
+        end
+
+        TriggerClientEvent('cuppa_admin:client:hideSelf', source, exceptionId)
+        notify(source, 'Hidden from everyone except player ' .. exceptionId, 'success')
+
+    elseif cmd == 'show' then
+        if not hasPermission(source, 'hide') then return notify(source, 'No permission', 'error') end
+        if source == 0 then return notify(source, 'Cannot use show from console', 'error') end
+        if not hiddenState[source] then return notify(source, 'You are not hidden', 'error') end
+
+        hiddenState[source] = nil
+
+        local players = exports.qbx_core:GetQBPlayers()
+        for id, _ in pairs(players) do
+            local idNum = tonumber(id)
+            if idNum ~= source then
+                TriggerClientEvent('cuppa_admin:client:showPlayer', idNum, source)
+            end
+        end
+
+        TriggerClientEvent('cuppa_admin:client:showSelf', source)
+        notify(source, 'Visibility restored', 'success')
+
+    elseif cmd == 'bucket' then
+        if not hasPermission(source, 'bucket') then return notify(source, 'No permission', 'error') end
+        if source == 0 then return notify(source, 'Cannot use bucket from console', 'error') end
+        local sub = args[2]
+
+        if sub == 'add' then
+            local bucketId = bucketState[source]
+            if not bucketId then
+                bucketId = source
+                bucketState[source] = bucketId
+                bucketMembers[bucketId] = {}
+                bucketAdmin[bucketId] = source
+                SetPlayerRoutingBucket(source, bucketId)
+                bucketMembers[bucketId][source] = true
+                local adminLicense = getLicense(source)
+                if adminLicense then bucketLicenses[adminLicense] = bucketId end
+            end
+
+            local added = 0
+            for i = 3, #args do
+                local target = tonumber(args[i])
+                if target then
+                    if not exports.qbx_core:GetPlayer(target) then
+                        notify(source, 'Player ' .. target .. ' not found, skipping', 'error')
+                    elseif bucketMembers[bucketId][target] then
+                        notify(source, 'Player ' .. target .. ' is already in bucket #' .. bucketId, 'error')
+                    else
+                        SetPlayerRoutingBucket(target, bucketId)
+                        bucketMembers[bucketId][target] = true
+                        bucketState[target] = bucketId
+                        local targetLicense = getLicense(target)
+                        if targetLicense then bucketLicenses[targetLicense] = bucketId end
+                        added = added + 1
+                    end
+                end
+            end
+
+            local memberCount = 0
+            for _ in pairs(bucketMembers[bucketId]) do memberCount = memberCount + 1 end
+            if added > 0 then
+                notify(source, ('Added %d player(s) to bucket #%d — %d player(s) total'):format(added, bucketId, memberCount), 'success')
+            else
+                notify(source, ('You are now in bucket #%d — %d player(s) total'):format(bucketId, memberCount), 'success')
+            end
+
+        elseif sub == 'leave' then
+            local bucketId = bucketState[source]
+            if not bucketId then return notify(source, 'You are not in a bucket', 'error') end
+            SetPlayerRoutingBucket(source, 0)
+            bucketState[source] = nil
+            local license = getLicense(source)
+            if license then bucketLicenses[license] = nil end
+            if bucketMembers[bucketId] then
+                bucketMembers[bucketId][source] = nil
+                if not next(bucketMembers[bucketId]) then
+                    bucketMembers[bucketId] = nil
+                    bucketAdmin[bucketId] = nil
+                end
+            end
+            notify(source, 'Left bucket #' .. bucketId .. ' — returned to main world', 'success')
+
+        elseif sub == 'kick' then
+            local bucketId = bucketState[source]
+            if not bucketId then return notify(source, 'You are not in a bucket', 'error') end
+            local target = tonumber(args[3])
+            if not target then return notify(source, 'Usage: cc bucket kick <id>', 'error') end
+            if not bucketMembers[bucketId] or not bucketMembers[bucketId][target] then
+                return notify(source, 'Player ' .. target .. ' is not in your bucket', 'error')
+            end
+            SetPlayerRoutingBucket(target, 0)
+            bucketMembers[bucketId][target] = nil
+            bucketState[target] = nil
+            local targetLicense = getLicense(target)
+            if targetLicense then bucketLicenses[targetLicense] = nil end
+            notify(source, 'Kicked player ' .. target .. ' from bucket #' .. bucketId, 'success')
+
+        elseif sub == 'rm' then
+            local targetBucket = tonumber(args[3])
+            if not targetBucket then return notify(source, 'Usage: cc bucket rm <bucket id>', 'error') end
+            if not bucketMembers[targetBucket] then return notify(source, 'Bucket #' .. targetBucket .. ' does not exist', 'error') end
+            local count = 0
+            for memberId in pairs(bucketMembers[targetBucket]) do
+                SetPlayerRoutingBucket(memberId, 0)
+                bucketState[memberId] = nil
+                local memberLicense = getLicense(memberId)
+                if memberLicense then bucketLicenses[memberLicense] = nil end
+                count = count + 1
+            end
+            bucketMembers[targetBucket] = nil
+            bucketAdmin[targetBucket] = nil
+            notify(source, 'Bucket #' .. targetBucket .. ' dissolved — ' .. count .. ' player(s) returned to main world', 'success')
+
+        elseif sub == 'status' then
+            local found = false
+            local lines = {}
+            for bId, members in pairs(bucketMembers) do
+                found = true
+                local adminId = bucketAdmin[bId]
+                local adminName = adminId and GetPlayerName(adminId) or 'Unknown'
+                table.insert(lines, ('Bucket #%d (Admin: %s)'):format(bId, adminName))
+                for memberId in pairs(members) do
+                    local name = GetPlayerName(memberId) or 'Unknown'
+                    table.insert(lines, ('  - [%d] %s'):format(memberId, name))
+                end
+                table.insert(lines, '')
+            end
+            if not found then
+                notify(source, 'No active buckets', 'inform')
+            else
+                print('^2[cuppa_admin] Active Buckets:^0')
+                for _, line in ipairs(lines) do
+                    print('  ' .. line)
+                end
+                notify(source, 'Bucket status printed to console', 'inform')
+            end
+
+        elseif sub == 'wipe' then
+            local totalPlayers = 0
+            local totalBuckets = 0
+            for bId, members in pairs(bucketMembers) do
+                totalBuckets = totalBuckets + 1
+                for memberId in pairs(members) do
+                    SetPlayerRoutingBucket(memberId, 0)
+                    bucketState[memberId] = nil
+                    local memberLicense = getLicense(memberId)
+                    if memberLicense then bucketLicenses[memberLicense] = nil end
+                    totalPlayers = totalPlayers + 1
+                end
+            end
+            bucketMembers = {}
+            bucketAdmin = {}
+            bucketLicenses = {}
+            if totalBuckets == 0 then
+                notify(source, 'No active buckets to wipe', 'inform')
+            else
+                notify(source, ('All buckets dissolved — %d player(s) returned to main world'):format(totalPlayers), 'success')
+            end
+
+        else
+            notify(source, 'Usage: cc bucket <add|leave|kick|rm|status|wipe>', 'error')
+        end
+
     else
         notify(source, 'Unknown command: cc ' .. cmd .. ' — run "cc help" for commands', 'error')
     end
 end, false)
+
+AddEventHandler('playerDropped', function()
+    local source = source
+    if hiddenState[source] then
+        hiddenState[source] = nil
+        local players = exports.qbx_core:GetQBPlayers()
+        for id, _ in pairs(players) do
+            local idNum = tonumber(id)
+            if idNum ~= source then
+                TriggerClientEvent('cuppa_admin:client:showPlayer', idNum, source)
+            end
+        end
+    end
+    if bucketState[source] then
+        local bucketId = bucketState[source]
+        bucketState[source] = nil
+        if bucketMembers[bucketId] then
+            bucketMembers[bucketId][source] = nil
+        end
+    end
+end)
+
+AddEventHandler('playerJoining', function()
+    local source = source
+    local license = getLicense(source)
+    if license and bucketLicenses[license] then
+        local bucketId = bucketLicenses[license]
+        SetPlayerRoutingBucket(source, bucketId)
+        bucketState[source] = bucketId
+        bucketMembers[bucketId] = bucketMembers[bucketId] or {}
+        bucketMembers[bucketId][source] = true
+    end
+end)

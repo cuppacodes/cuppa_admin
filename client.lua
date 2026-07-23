@@ -2,6 +2,8 @@ local noclip = false
 local godmode = false
 local hiddenFrom = {}
 local iAmHidden = false
+local concealedPlayers = {} -- players concealed on my screen (serverId -> true)
+local myHideException = nil -- if I'm hiding, who can still see me
 
 RegisterNetEvent('cuppa_admin:client:kill', function()
     SetEntityHealth(cache.ped, 0)
@@ -49,20 +51,63 @@ RegisterNetEvent('cuppa_admin:client:visible', function(target)
     hiddenFrom[target] = not hiddenFrom[target] or nil
 end)
 
+RegisterNetEvent('cuppa_admin:client:concealPlayer', function(serverId)
+    concealedPlayers[serverId] = true
+end)
+
+RegisterNetEvent('cuppa_admin:client:showPlayer', function(serverId)
+    concealedPlayers[serverId] = nil
+end)
+
+RegisterNetEvent('cuppa_admin:client:hideSelf', function(exceptionId)
+    myHideException = exceptionId
+end)
+
+RegisterNetEvent('cuppa_admin:client:showSelf', function()
+    myHideException = nil
+end)
+
 CreateThread(function()
     while true do
-        Wait(0)
+        local sleep = 1000
         local myId = cache.playerId
+        local myPed = cache.ped
         local players = GetActivePlayers()
+
         for _, playerIdx in ipairs(players) do
             local serverId = GetPlayerServerId(playerIdx)
-            if serverId ~= myId and (iAmHidden or hiddenFrom[serverId]) then
+            if serverId ~= myId then
                 local targetPed = GetPlayerPed(playerIdx)
-                if targetPed and targetPed ~= 0 then
-                    SetEntityVisible(targetPed, false, false)
+
+                -- Conceal players hidden from me (old visible system)
+                if iAmHidden or hiddenFrom[serverId] then
+                    if targetPed and targetPed ~= 0 then
+                        SetEntityVisible(targetPed, false, false)
+                    end
+                end
+
+                -- Conceal players on the server-sent list (cc hide system)
+                if concealedPlayers[serverId] then
+                    sleep = 250
+                    if targetPed and targetPed ~= 0 then
+                        NetworkConcealPlayer(playerIdx, true, false)
+                        SetEntityNoCollisionEntity(myPed, targetPed, false)
+                        MumbleSetVolumeOverrideByServerId(serverId, 0.0)
+                    end
+                end
+
+                -- When I'm hiding, conceal everyone except my exception
+                if myHideException and serverId ~= myHideException then
+                    sleep = 250
+                    if targetPed and targetPed ~= 0 then
+                        NetworkConcealPlayer(playerIdx, true, false)
+                        SetEntityNoCollisionEntity(myPed, targetPed, false)
+                        MumbleSetVolumeOverrideByServerId(serverId, 0.0)
+                    end
                 end
             end
         end
+        Wait(sleep)
     end
 end)
 

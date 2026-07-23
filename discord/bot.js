@@ -38,10 +38,13 @@ function stripAnsi(str) {
     return str.replace(/\x1B\[[0-9;]*[mK]/g, '').replace(/\^[0-9]/g, '').trim();
 }
 
-// Check if user has required role
+// Check if user has required role (supports both IDs and names)
 function hasPermission(member) {
     if (!config.discord.adminRoles || config.discord.adminRoles.length === 0) return true;
-    return member.roles.cache.some(role => config.discord.adminRoles.includes(role.name));
+    return member.roles.cache.some(role =>
+        config.discord.adminRoles.includes(role.id) ||
+        config.discord.adminRoles.includes(role.name)
+    );
 }
 
 // Rate limit check
@@ -147,7 +150,7 @@ function formatOutput(output) {
 }
 
 // Bot ready
-client.once('ready', () => {
+client.once('clientReady', () => {
     console.log(`Logged in as ${client.user.tag}`);
     console.log(`Prefix: ${config.discord.prefix}`);
     console.log(`Admin Channel: ${config.discord.adminChannelId || 'any'}`);
