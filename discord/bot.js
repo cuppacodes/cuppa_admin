@@ -1,27 +1,14 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const { Rcon } = require('rcon-client');
 const fs = require('fs');
 const path = require('path');
 
-// Load config
-const configPath = path.join(__dirname, 'config.json');
-if (!fs.existsSync(configPath)) {
-    console.error('config.json not found. Copy config.json and fill in your settings.');
-    process.exit(1);
-}
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
 
-// Validate config
-if (!config.discord.token || config.discord.token === 'YOUR_BOT_TOKEN') {
-    console.error('Please set your Discord bot token in config.json');
-    process.exit(1);
-}
-if (!config.fivem.rconPassword || config.fivem.rconPassword === 'YOUR_RCON_PASSWORD') {
-    console.error('Please set your RCON password in config.json');
+if (!config.token || config.token === 'YOUR_BOT_TOKEN') {
+    console.error('Set your bot token in config.json');
     process.exit(1);
 }
 
-// Discord client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -30,80 +17,39 @@ const client = new Client({
     ]
 });
 
-// Rate limiting
 const lastCommand = new Map();
 
-// Strip ANSI color codes from RCON output
-function stripAnsi(str) {
-    return str.replace(/\x1B\[[0-9;]*[mK]/g, '').replace(/\^[0-9]/g, '').trim();
-}
-
-// Check if user has required role (supports both IDs and names)
 function hasPermission(member) {
-    if (!config.discord.adminRoles || config.discord.adminRoles.length === 0) return true;
-    return member.roles.cache.some(role =>
-        config.discord.adminRoles.includes(role.id) ||
-        config.discord.adminRoles.includes(role.name)
-    );
+    if (!config.adminRoles || config.adminRoles.length === 0) return true;
+    return member.roles.cache.some(role => config.adminRoles.includes(role.id));
 }
 
-// Rate limit check
 function isRateLimited(userId) {
     const now = Date.now();
     const last = lastCommand.get(userId) || 0;
-    if (now - last < config.discord.rateLimitMs) return true;
+    if (now - last < (config.rateLimitMs || 1000)) return true;
     lastCommand.set(userId, now);
     return false;
 }
 
-// Execute RCON command
-async function executeRcon(command) {
-    let rcon;
-    try {
-        rcon = await Rcon.connect({
-            host: config.fivem.host,
-            port: config.fivem.port,
-            password: config.fivem.rconPassword,
-            timeout: 5000,
-        });
-        const response = await rcon.send(command);
-        await rcon.end();
-        return response;
-    } catch (error) {
-        if (rcon) try { await rcon.end(); } catch {}
-        throw error;
-    }
+function stripAnsi(str) {
+    return str.replace(/\x1B\[[0-9;]*[mK]/g, '').replace(/\^[0-9]/g, '').trim();
 }
 
-// Log to audit channel
-async function auditLog(message, command, result) {
-    if (!config.discord.auditChannelId) return;
-    try {
-        const channel = await client.channels.fetch(config.discord.auditChannelId);
-        if (!channel) return;
-        const embed = new EmbedBuilder()
-            .setColor(0x3498db)
-            .setTitle('Admin Command')
-            .addFields(
-                { name: 'Admin', value: `${message.author.tag} (${message.author.id})`, inline: true },
-                { name: 'Command', value: `\`${command}\``, inline: false },
-                { name: 'Result', value: stripAnsi(result || 'No output') || 'No output', inline: false },
-            )
-            .setTimestamp();
-        await channel.send({ embeds: [embed] });
-    } catch (error) {
-        console.error('Audit log failed:', error.message);
-    }
+async function sendToFiveM(command, userId) {
+    const body = JSON.stringify({ command, userId, secret: config.bridgeSecret });
+    const url = `http://127.0.0.1:${config.fivemPort || 30120}/cuppa_admin/discord?body=${encodeURIComponent(body)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.output || 'Command executed (no output)';
 }
 
-// Handle status command via HTTP API
 async function handleStatus(message) {
     try {
-        const baseUrl = `http://${config.fivem.host}:${config.fivem.port}`;
-
+        const port = config.fivemPort || 30120;
         const [playersRes, infoRes] = await Promise.all([
-            fetch(`${baseUrl}/players.json`),
-            fetch(`${baseUrl}/info.json`),
+            fetch(`http://127.0.0.1:${port}/players.json`),
+            fetch(`http://127.0.0.1:${port}/info.json`),
         ]);
 
         if (!playersRes.ok || !infoRes.ok) {
@@ -134,139 +80,108 @@ async function handleStatus(message) {
 
         await message.reply({ embeds: [embed] });
     } catch (error) {
-        message.reply(`Error fetching server status: \`${error.message}\``);
+        message.reply(`Error: \`${error.message}\``);
     }
 }
 
-// Format RCON output for Discord
-function formatOutput(output) {
-    const clean = stripAnsi(output);
-    if (!clean) return 'Command executed (no output)';
-    // Use code block for multi-line output
-    if (clean.includes('\n')) {
-        return '```\n' + clean + '\n```';
-    }
-    return clean;
+function showHelp() {
+    return [
+        '`!cc` — Server status / player list',
+        '`!cc stats` — List all online players',
+        '`!cc help` — Show this help',
+        '`!cc announce <msg>` — Server-wide announcement',
+        '`!cc kick [reason] <id>` — Kick a player',
+        '`!cc ban [reason] [dur] <id>` — Ban (dur: 24h/7d/1m/1y)',
+        '`!cc unban <banid>` — Unban by ban ID',
+        '`!cc baninfo <banid>` — Look up ban details',
+        '`!cc undo <id>` — Reverse last admin action',
+        '`!cc heal <id>` — Heal a player',
+        '`!cc kill [id]` — Kill a player',
+        '`!cc revive <id>` — Revive a player',
+        '`!cc freeze <id|all>` — Toggle freeze on a player (or all)',
+        '`!cc tp <id> [id]` — Teleport player',
+        '`!cc godmode [id]` — Toggle godmode',
+        '`!cc visible [id]` — Toggle visibility',
+        '`!cc hide <id>` — Hide from everyone except <id>',
+        '`!cc show` — Restore visibility',
+        '`!cc car <model> [id]` — Spawn vehicle',
+        '`!cc fix [id]` — Fix vehicle',
+        '`!cc dv [radius] [id]` — Delete vehicle(s)',
+        '`!cc giveitem <item> [n] <id>` — Give items',
+        '`!cc setjob <job> [grade] <id>` — Set job',
+        '`!cc setgang <gang> [grade] <id>` — Set gang',
+        '`!cc givecash <amount> <id>` — Give cash',
+        '`!cc givebank <amount> <id>` — Give bank',
+        '`!cc armor [amount] <id>` — Set armor',
+        '`!cc setmodel <model> [id]` — Set model',
+        '`!cc noclip [id]` — Toggle noclip',
+        '`!cc bucket` — Bucket status / create',
+        '`!cc bucket <id>` — Add player to bucket',
+        '`!cc bucket -<id>` — Remove from bucket',
+        '`!cc bucket destroy [id]` — Dissolve bucket',
+        '`!cc bucket wipe` — Destroy all buckets',
+    ].join('\n');
 }
 
-// Bot ready
 client.once('clientReady', () => {
     console.log(`Logged in as ${client.user.tag}`);
-    console.log(`Prefix: ${config.discord.prefix}`);
-    console.log(`Admin Channel: ${config.discord.adminChannelId || 'any'}`);
-    console.log(`Admin Roles: ${config.discord.adminRoles.join(', ') || 'all'}`);
-    console.log(`FiveM: ${config.fivem.host}:${config.fivem.port}`);
+    console.log(`Prefix: ${config.prefix}`);
+    console.log(`Channel: ${config.adminChannelId || 'any'}`);
+    console.log(`Roles: ${config.adminRoles?.join(', ') || 'all'}`);
 });
 
-// Message handler
 client.on('messageCreate', async (message) => {
     try {
-        // Ignore bots and DMs
         if (message.author.bot) return;
         if (!message.guild) return;
-
-        // Check prefix
-        const prefix = config.discord.prefix;
-        if (!message.content.startsWith(prefix)) return;
-
-        // Check channel (if configured)
-        if (config.discord.adminChannelId && message.channel.id !== config.discord.adminChannelId) return;
-
-        // Check permissions
+        if (!message.content.startsWith(config.prefix)) return;
+        if (config.adminChannelId && message.channel.id !== config.adminChannelId) return;
         if (!hasPermission(message.member)) {
             return message.reply('You do not have permission to use this command.');
         }
-
-        // Rate limiting
         if (isRateLimited(message.author.id)) {
             return message.reply('Please wait before using another command.');
         }
 
-        // Parse command
-        const content = message.content.slice(prefix.length).trim();
-        if (!content) {
-            // No command — show player list
-            return handleStatus(message);
-        }
+        const content = message.content.slice(config.prefix.length).trim();
+
+        if (!content) return handleStatus(message);
 
         const args = content.split(/\s+/);
         const cmd = args[0].toLowerCase();
 
-        // Handle status
-        if (cmd === 'status') {
-            return handleStatus(message);
-        }
+        if (cmd === 'status') return handleStatus(message);
+        if (cmd === 'help') return message.reply(showHelp());
 
-        // Handle help
-        if (cmd === 'help') {
-            const helpText = [
-                '`!cc` — Server status / player list',
-                '`!cc help` — Show this help',
-                '`!cc kick <id> [reason]` — Kick a player',
-                '`!cc ban <id> [reason] [dur]` — Ban a player (dur: 24h/7d/1m/1y)',
-                '`!cc unban <banid>` — Unban by ban ID',
-                '`!cc heal [id]` — Heal a player',
-                '`!cc kill [id]` — Kill a player',
-                '`!cc revive [id]` — Revive a player',
-                '`!cc freeze [id]` — Freeze a player',
-                '`!cc unfreeze [id]` — Unfreeze a player',
-                '`!cc tp <id> [id]` — Teleport player',
-                '`!cc godmode [id]` — Toggle godmode',
-                '`!cc visible [id]` — Toggle visibility',
-                '`!cc vehicle <model> [id]` — Spawn vehicle',
-                '`!cc fix [id]` — Fix vehicle',
-                '`!cc dv [id] [radius]` — Delete vehicle(s)',
-                '`!cc giveitem <id> <item> [n]` — Give items',
-                '`!cc setjob <id> <job> [grade]` — Set job',
-                '`!cc setgang <id> <gang> [grade]` — Set gang',
-                '`!cc givecash <id> <amount>` — Give cash',
-                '`!cc givebank <id> <amount>` — Give bank',
-                '`!cc armor <id> [amount]` — Set armor',
-                '`!cc setmodel <model> [id]` — Set model',
-                '`!cc noclip [id]` — Toggle noclip',
-            ].join('\n');
-            return message.reply(helpText);
-        }
-
-        // Execute command via RCON
-        const rconCommand = content;
         await message.deferReply();
 
         try {
-            const response = await executeRcon(rconCommand);
-            const formatted = formatOutput(response);
-            await message.editReply(formatted);
-            await auditLog(message, rconCommand, response);
+            const output = await sendToFiveM(content, message.author.id);
+            const clean = stripAnsi(output);
+            if (!clean) {
+                await message.editReply('Command executed (no output)');
+            } else if (clean.includes('\n')) {
+                await message.editReply('```\n' + clean + '\n```');
+            } else {
+                await message.editReply(clean);
+            }
         } catch (error) {
-            await message.editReply(`Error executing command: \`${error.message}\``);
+            await message.editReply(`Error: \`${error.message}\``);
         }
-
     } catch (error) {
         console.error('Message handler error:', error);
         try {
-            if (message.replied) return;
-            if (message.deferred) {
-                await message.editReply('An unexpected error occurred.');
-            } else {
-                await message.reply('An unexpected error occurred.');
-            }
+            if (message.deferred) await message.editReply('An unexpected error occurred.');
+            else await message.reply('An unexpected error occurred.');
         } catch {}
     }
 });
 
-// Error handling
-client.on('error', error => {
-    console.error('Discord client error:', error.message);
-});
+client.on('error', error => console.error('Discord error:', error.message));
+client.on('disconnect', () => console.log('Disconnected. Reconnecting...'));
 
-// Reconnect on disconnect
-client.on('disconnect', () => {
-    console.log('Disconnected from Discord. Reconnecting...');
-});
-
-// Login
-console.log('Starting cuppa_admin Discord bot...');
-client.login(config.discord.token).catch(error => {
+console.log('Starting cuppa_admin Discord bridge...');
+client.login(config.token).catch(error => {
     console.error('Failed to login:', error.message);
     process.exit(1);
 });

@@ -5,12 +5,28 @@ local bucketState = {} -- [source] = bucketId
 local bucketMembers = {} -- [bucketId] = {[source] = true, ...}
 local bucketAdmin = {} -- [bucketId] = adminSource
 local bucketLicenses = {} -- [license] = bucketId (persists across disconnects)
+local undoState = {} -- [targetId] = { action, previous }
+
+local MAX_REASON_LENGTH = 256
+local MAX_MONEY = 10000000
+local MAX_DV_RADIUS = 500
+local MAX_GIVEITEM = 9999
+local commandOutput = nil -- set by executeCommand to capture notify() output
+
+local validModels = {}
+local function isValidModel(model)
+    if validModels[model] ~= nil then return validModels[model] end
+    local hash = joaat(model)
+    local success = pcall(function() RequestModel(hash) end)
+    validModels[model] = success and IsModelValid(hash) or false
+    if validModels[model] then SetModelAsNoLongerNeeded(hash) end
+    return validModels[model]
+end
 
 local function getLicense(source)
     return GetPlayerIdentifierByType(source, 'license')
 end
 
--- Detect which medical resource is available
 local medicalResource = nil
 if GetResourceState('wasabi_ambulance_v2') == 'started' then
     medicalResource = 'wasabi'
@@ -68,18 +84,36 @@ local function notify(source, msg, type)
     else
         exports.qbx_core:Notify(source, msg, type or 'inform')
     end
+    if commandOutput ~= nil then
+        commandOutput = commandOutput .. msg .. '\n'
+    end
 end
 
+--- Undo system: save state before a reversible action
+---@param target number
+---@param action string
+---@param previous table
+local function saveUndo(target, action, previous)
+    undoState[target] = { action = action, previous = previous }
+end
+
+--- Parse ban duration string (e.g. "24h", "7d", "1m", "1y")
+--- Returns seconds, or nil if invalid. Caps at config.MAX_BAN_DURATION.
 local function parseBanDuration(str)
     if not str then return nil end
     local num, unit = str:match('^(%d+)([hdmy])$')
     if not num then return nil end
     num = tonumber(num)
-    if unit == 'h' then return num * 3600 end
-    if unit == 'd' then return num * 86400 end
-    if unit == 'm' then return num * 2592000 end
-    if unit == 'y' then return num * 31536000 end
-    return nil
+    local seconds
+    if unit == 'h' then seconds = num * 3600
+    elseif unit == 'd' then seconds = num * 86400
+    elseif unit == 'm' then seconds = num * 2592000
+    elseif unit == 'y' then seconds = num * 31536000
+    else return nil end
+    if seconds > config.MAX_BAN_DURATION then
+        seconds = config.MAX_BAN_DURATION
+    end
+    return seconds
 end
 
 local function formatDuration(seconds)
@@ -89,6 +123,11 @@ local function formatDuration(seconds)
     if seconds >= 86400 then return math.floor(seconds / 86400) .. 'd' end
     if seconds >= 3600 then return math.floor(seconds / 3600) .. 'h' end
     return seconds .. 's'
+end
+
+local function formatTimestamp(unix)
+    if not unix or unix >= 2147483647 then return 'never' end
+    return os.date('%Y-%m-%d %H:%M', unix)
 end
 
 local function getAllIdentifiers(source)
@@ -103,80 +142,99 @@ local function getAllIdentifiers(source)
     return ids
 end
 
-local function logBanToDiscord(banId, name, ids, reason, bannedBy, durationText)
-    if not config.banWebhook then return end
-    local idList = ''
-    for k, v in pairs(ids) do
-        idList = idList .. k .. ': `' .. v .. '`\n'
-    end
+--- Generic Discord action logging
+---@param title string
+---@param color number
+---@param fields table
+---@param admin string
+local function logActionToDiscord(title, color, fields, admin)
+    local webhook = config.adminWebhook
+    if not webhook then return end
     local embed = {
         {
-            title = 'Player Banned',
-            color = 16711680,
-            fields = {
-                {name = 'Ban ID', value = '#' .. banId, inline = true},
-                {name = 'Player', value = name, inline = true},
-                {name = 'Duration', value = durationText, inline = true},
-                {name = 'Banned By', value = bannedBy, inline = true},
-                {name = 'Reason', value = reason, inline = false},
-                {name = 'Identifiers', value = idList ~= '' and idList or 'None', inline = false},
-            },
+            title = title,
+            color = color,
+            fields = fields,
+            footer = { text = 'cuppa_admin' },
             timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ'),
         }
     }
-    PerformHttpRequest(config.banWebhook, function() end, 'POST',
+    PerformHttpRequest(webhook, function() end, 'POST',
         json.encode({embeds = embed}),
         {['Content-Type'] = 'application/json'}
     )
 end
 
+local function logBanToDiscord(banId, name, ids, reason, bannedBy, durationText)
+    local idList = ''
+    for k, v in pairs(ids) do
+        idList = idList .. k .. ': `' .. v .. '`\n'
+    end
+    logActionToDiscord('Player Banned', 16711680, {
+        {name = 'Ban ID', value = '#' .. banId, inline = true},
+        {name = 'Player', value = name, inline = true},
+        {name = 'Duration', value = durationText, inline = true},
+        {name = 'Banned By', value = bannedBy, inline = true},
+        {name = 'Reason', value = reason, inline = false},
+        {name = 'Identifiers', value = idList ~= '' and idList or 'None', inline = false},
+    }, bannedBy)
+end
+
+local function logAdminAction(action, details, admin)
+    if not config.logAllActions then return end
+    print(('[cuppa_admin] %s by %s: %s'):format(action, admin or 'Console', details))
+end
+
 local function showHelp(source)
     local cmds = {
-        {'cc',                              'List all online players'},
-        {'cc help',                         'Show this help message'},
-        {'cc kick <id> [reason]',           'Kick a player'},
-        {'cc ban <id> [reason] [dur]',     'Ban a player (dur: 24h/7d/1m/1y)'},
-        {'cc unban <banid>',                'Unban a player by ban ID'},
-        {'cc heal <id>',                    'Fully heal a player + full armor'},
-        {'cc kill [id]',                    'Kill a player (or self)'},
-        {'cc revive <id>',                  'Revive a player'},
-        {'cc freeze <id>',                  'Freeze a player in place'},
-        {'cc unfreeze <id>',                'Unfreeze a player'},
-        {'cc goto <id>',                    'Teleport to a player (in-game only)'},
-        {'cc bring <id>',                   'Bring a player to you (in-game only)'},
-        {'cc vehicle <model> [id]',         'Spawn a vehicle for a player'},
-        {'cc fix [id]',                     'Fix a player\'s vehicle'},
-        {'cc dv [id] [radius]',             'Delete vehicle(s) near a player (meters)'},
-        {'cc giveitem <id> <item> [n]',     'Give items to a player'},
-        {'cc setjob <id> <job> [grade]',    'Set a player\'s job'},
-        {'cc setgang <id> <gang> [grade]',  'Set a player\'s gang'},
-        {'cc givecash <id> <amount>',       'Give cash to a player'},
-        {'cc givebank <id> <amount>',       'Give bank money to a player'},
-        {'cc armor <id> [amount]',          'Set player armor (0-100)'},
-        {'cc setmodel <model> [id]',        'Change a player\'s ped model'},
-        {'cc noclip [id]',                  'Toggle noclip for a player'},
-        {'cc tp <id> <id>',                 'Teleport player A to player B'},
-        {'cc godmode [id]',                 'Toggle godmode for a player'},
-        {'cc visible [id]',                 'Toggle player visible/invisible (on your screen)'},
-        {'cc hide <id>',                    'Hide yourself from everyone except <id>'},
-        {'cc show',                         'Restore normal visibility (undo cc hide)'},
-        {'cc bucket add [id...]',           'Create a bucket (optionally with players)'},
-        {'cc bucket leave',                 'Leave your current bucket'},
-        {'cc bucket kick <id>',             'Kick a player from your bucket'},
-        {'cc bucket rm <bucket id>',        'Destroy a bucket, return all members to main world'},
-        {'cc bucket status',                'Show all active buckets with members'},
-        {'cc bucket wipe',                  'Destroy ALL buckets, everyone back to main world'},
+        {'cc',                                'Show this help message'},
+        {'cc stats',                          'List all online players'},
+        {'cc announce <msg>',                 'Send server-wide announcement'},
+        {'cc kick [reason] <id>',             'Kick a player'},
+        {'cc ban [reason] [dur] <id>',       'Ban a player (dur: 24h/7d/1m/1y)'},
+        {'cc unban <banid>',                  'Unban a player by ban ID'},
+        {'cc baninfo <banid>',                'Look up ban details'},
+        {'cc undo <id>',                      'Reverse last admin action on a player'},
+        {'cc heal <id>',                      'Fully heal a player + full armor'},
+        {'cc kill [id]',                      'Kill a player (or self)'},
+        {'cc revive <id>',                    'Revive a player'},
+        {'cc freeze <id|all>',                'Toggle freeze on a player (or all players)'},
+        {'cc goto <id>',                      'Teleport to a player (in-game only)'},
+        {'cc bring <id>',                     'Bring a player to you (in-game only)'},
+        {'cc car <model> [id]',               'Spawn a vehicle for a player'},
+        {'cc fix [id]',                       'Fix a player\'s vehicle'},
+        {'cc dv [radius] [id]',               'Delete vehicle(s) near a player (meters)'},
+        {'cc giveitem <item> [n] <id>',       'Give items to a player'},
+        {'cc setjob <job> [grade] <id>',      'Set a player\'s job'},
+        {'cc setgang <gang> [grade] <id>',    'Set a player\'s gang'},
+        {'cc givecash <amount> <id>',         'Give cash to a player'},
+        {'cc givebank <amount> <id>',         'Give bank money to a player'},
+        {'cc armor [amount] <id>',            'Set player armor (0-100)'},
+        {'cc setmodel <model> [id]',          'Change a player\'s ped model'},
+        {'cc noclip [id]',                    'Toggle noclip for a player'},
+        {'cc tp <id> <id>',                   'Teleport player A to player B'},
+        {'cc godmode [id]',                   'Toggle godmode for a player'},
+        {'cc visible [id]',                   'Toggle player visible/invisible (on your screen)'},
+        {'cc hide <id>',                      'Hide yourself from everyone except <id>'},
+        {'cc show',                           'Restore normal visibility (undo cc hide)'},
+        {'cc bucket',                         'Show bucket status (or create one)'},
+        {'cc bucket <id>',                    'Add player to your bucket'},
+        {'cc bucket -<id>',                   'Remove player from your bucket'},
+        {'cc bucket destroy [id]',            'Dissolve your bucket (or by ID)'},
+        {'cc bucket wipe',                    'Destroy ALL buckets'},
     }
     print('^2[cuppa_admin] Available Commands:^0')
     for _, cmd in ipairs(cmds) do
-        print(('  ^3%-32s^0 %s'):format(cmd[1], cmd[2]))
+        print(('  ^3%-38s^0 %s'):format(cmd[1], cmd[2]))
     end
     print('')
     print('^2[cuppa_admin] Notes:^0')
+    print('  - Player ID is always the last argument')
     print('  - When run from console, player ID is required')
     print('  - When run in-game, omitting ID targets yourself')
     print('  - goto/bring only work in-game (not from console)')
     print('  - Ban returns an ID (e.g. #42) — use cc unban <id> to reverse')
+    print('  - Use cc undo <id> to reverse setjob/setgang/givecash/givebank/armor/setmodel')
 end
 
 local function listPlayers(source)
@@ -190,29 +248,51 @@ local function listPlayers(source)
     end
 end
 
-RegisterCommand(config.prefix, function(source, args)
+local function handleCommand(source, args)
     local cmd = args[1]
-    if not cmd then return listPlayers(source) end
-    if cmd == 'help' then return showHelp(source) end
+    if not cmd then return showHelp(source) end
+    if cmd == 'stats' then return listPlayers(source) end
 
-    if cmd == 'kick' then
+    if cmd == 'announce' then
+        if not hasPermission(source, 'announce') then return notify(source, 'No permission', 'error') end
+        if #args < 2 then return notify(source, 'Usage: cc announce <message>', 'error') end
+        local msg = table.concat(args, ' ', 2)
+        local players = GetPlayers()
+        for i = 1, #players do
+            TriggerClientEvent('cuppa_admin:client:announce', tonumber(players[i]), msg)
+        end
+        logAdminAction('Announce', msg, source == 0 and 'Console' or GetPlayerName(source))
+        notify(source, 'Announced: ' .. msg, 'success')
+
+    elseif cmd == 'kick' then
         if not hasPermission(source, 'kick') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local reason = table.concat(args, ' ', 3) or 'No reason provided'
+        if #args < 2 then return notify(source, 'Usage: cc kick [reason] <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc kick [reason] <id>', 'error') end
+        if source ~= 0 and target == source then return notify(source, 'Cannot kick yourself', 'error') end
+        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local reason = #args > 2 and table.concat(args, ' ', 2, #args - 1) or 'No reason provided'
+        if #reason > MAX_REASON_LENGTH then reason = reason:sub(1, MAX_REASON_LENGTH) end
+        local adminName = source == 0 and 'Console' or GetPlayerName(source)
+        logAdminAction('Kick', ('%s kicked %s: %s'):format(adminName, GetPlayerName(target), reason), adminName)
         DropPlayer(target, reason)
         notify(source, 'Kicked player ' .. target .. ': ' .. reason, 'success')
 
     elseif cmd == 'ban' then
         if not hasPermission(source, 'ban') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
+        if #args < 2 then return notify(source, 'Usage: cc ban [reason] [dur] <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc ban [reason] [dur] <id>', 'error') end
+        if source ~= 0 and target == source then return notify(source, 'Cannot ban yourself', 'error') end
+        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
         local name = GetPlayerName(target) or 'Unknown'
         local ids = getAllIdentifiers(target)
-        local durationStr = args[#args]
+        local durationStr = #args >= 3 and args[#args - 1] or nil
         local duration = parseBanDuration(durationStr)
-        local reasonEnd = duration and (#args - 1) or #args
-        local reason = table.concat(args, ' ', 3, reasonEnd) or 'No reason provided'
+        local reasonStart = duration and 2 or 2
+        local reasonEnd = duration and (#args - 2) or (#args - 1)
+        local reason = reasonEnd >= reasonStart and table.concat(args, ' ', reasonStart, reasonEnd) or 'No reason provided'
+        if #reason > MAX_REASON_LENGTH then reason = reason:sub(1, MAX_REASON_LENGTH) end
         local durationText = formatDuration(duration)
         local expire = duration and (os.time() + duration) or 2147483647
         local bannedBy = source == 0 and 'Console' or GetPlayerName(source)
@@ -246,12 +326,86 @@ RegisterCommand(config.prefix, function(source, args)
             MySQL.Async.execute('DELETE FROM bans WHERE id = ?', {banId}, function(rowsAffected)
                 if rowsAffected and rowsAffected > 0 then
                     print('^2[cuppa_admin] Unbanned: ' .. result[1].name .. ' (Ban ID: #' .. banId .. ')^0')
+                    logAdminAction('Unban', ('Unbanned %s (#%d)'):format(result[1].name, banId), source == 0 and 'Console' or GetPlayerName(source))
                     notify(source, ('Unbanned %s (Ban ID: #%d)'):format(result[1].name, banId), 'success')
                 else
                     notify(source, 'Failed to remove ban', 'error')
                 end
             end)
         end)
+
+    elseif cmd == 'baninfo' then
+        if not hasPermission(source, 'baninfo') then return notify(source, 'No permission', 'error') end
+        local banId = tonumber(args[2])
+        if not banId then return notify(source, 'Usage: cc baninfo <banid>', 'error') end
+        MySQL.Async.fetch('SELECT * FROM bans WHERE id = ?', {banId}, function(result)
+            if not result or not result[1] then
+                return notify(source, 'No ban found with ID #' .. banId, 'error')
+            end
+            local b = result[1]
+            local isExpired = b.expire and b.expire < os.time()
+            local status = isExpired and 'Expired' or 'Active'
+            print('^2[cuppa_admin] Ban #' .. banId .. ' — ' .. status .. '^0')
+            print('  Player: ' .. (b.name or 'Unknown'))
+            print('  Banned by: ' .. (b.bannedby or 'Unknown'))
+            print('  Reason: ' .. (b.reason or 'None'))
+            if b.expire and b.expire < 2147483647 then
+                print('  Expires: ' .. formatTimestamp(b.expire) .. ' (' .. formatDuration(b.expire - os.time()) .. ')')
+            else
+                print('  Expires: never (permanent)')
+            end
+            if b.license and b.license ~= '' then print('  License: ' .. b.license) end
+            if b.discord and b.discord ~= '' then print('  Discord: ' .. b.discord) end
+            if b.ip and b.ip ~= '' then print('  IP: ' .. b.ip) end
+            notify(source, 'Ban info printed to console', 'inform')
+        end)
+
+    elseif cmd == 'undo' then
+        if not hasPermission(source, 'undo') then return notify(source, 'No permission', 'error') end
+        local target = tonumber(args[2])
+        if not target then return notify(source, 'Usage: cc undo <id>', 'error') end
+        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local state = undoState[target]
+        if not state then return notify(source, 'Nothing to undo for player ' .. target, 'error') end
+        local player = exports.qbx_core:GetPlayer(target)
+        if state.action == 'setjob' then
+            exports.qbx_core:SetJob(target, state.previous.job, state.previous.grade)
+            notify(source, 'Reverted player ' .. target .. ' job to ' .. state.previous.job .. ' grade ' .. state.previous.grade, 'success')
+        elseif state.action == 'setgang' then
+            exports.qbx_core:SetGang(target, state.previous.gang, state.previous.grade)
+            notify(source, 'Reverted player ' .. target .. ' gang to ' .. state.previous.gang .. ' grade ' .. state.previous.grade, 'success')
+        elseif state.action == 'givecash' then
+            local currentCash = player.PlayerData.money.cash
+            local diff = currentCash - state.previous.amount
+            if diff > 0 then
+                exports.qbx_core:RemoveMoney(target, 'cash', diff, 'cuppa_admin_undo')
+            elseif diff < 0 then
+                exports.qbx_core:AddMoney(target, 'cash', -diff, 'cuppa_admin_undo')
+            end
+            notify(source, 'Reverted player ' .. target .. ' cash to $' .. state.previous.amount, 'success')
+        elseif state.action == 'givebank' then
+            local currentBank = player.PlayerData.money.bank
+            local diff = currentBank - state.previous.amount
+            if diff > 0 then
+                exports.qbx_core:RemoveMoney(target, 'bank', diff, 'cuppa_admin_undo')
+            elseif diff < 0 then
+                exports.qbx_core:AddMoney(target, 'bank', -diff, 'cuppa_admin_undo')
+            end
+            notify(source, 'Reverted player ' .. target .. ' bank to $' .. state.previous.amount, 'success')
+        elseif state.action == 'armor' then
+            player.Functions.SetMetaData('armor', state.previous.amount)
+            SetPedArmour(GetPlayerPed(target), state.previous.amount)
+            notify(source, 'Reverted player ' .. target .. ' armor to ' .. state.previous.amount, 'success')
+        elseif state.action == 'setmodel' then
+            TriggerClientEvent('cuppa_admin:client:setModel', target, state.previous.model)
+            notify(source, 'Reverted player ' .. target .. ' model', 'success')
+        else
+            notify(source, 'Unknown action type: ' .. tostring(state.action), 'error')
+            undoState[target] = nil
+            return
+        end
+        undoState[target] = nil
+        logAdminAction('Undo', ('Reverted %s on player %d'):format(state.action, target), source == 0 and 'Console' or GetPlayerName(source))
 
     elseif cmd == 'heal' then
         if not hasPermission(source, 'heal') then return notify(source, 'No permission', 'error') end
@@ -280,21 +434,39 @@ RegisterCommand(config.prefix, function(source, args)
 
     elseif cmd == 'freeze' then
         if not hasPermission(source, 'freeze') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        FreezeEntityPosition(GetPlayerPed(target), true)
-        isFrozen[target] = true
-        notify(source, 'Froze player ' .. target, 'success')
-
-    elseif cmd == 'unfreeze' then
-        if not hasPermission(source, 'unfreeze') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        FreezeEntityPosition(GetPlayerPed(target), false)
-        isFrozen[target] = nil
-        notify(source, 'Unfroze player ' .. target, 'success')
+        local targetArg = args[2]
+        if targetArg == 'all' then
+            local players = exports.qbx_core:GetQBPlayers()
+            local frozen = 0
+            local unfrozen = 0
+            for id, _ in pairs(players) do
+                local idNum = tonumber(id)
+                if isFrozen[idNum] then
+                    FreezeEntityPosition(GetPlayerPed(idNum), false)
+                    isFrozen[idNum] = nil
+                    unfrozen = unfrozen + 1
+                else
+                    FreezeEntityPosition(GetPlayerPed(idNum), true)
+                    isFrozen[idNum] = true
+                    frozen = frozen + 1
+                end
+            end
+            logAdminAction('Freeze All', ('Froze %d, unfroze %d'):format(frozen, unfrozen), source == 0 and 'Console' or GetPlayerName(source))
+            notify(source, 'Froze ' .. frozen .. ', unfroze ' .. unfrozen .. ' players', 'success')
+        else
+            local target = getTarget(source, targetArg)
+            if not target then return end
+            if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+            if isFrozen[target] then
+                FreezeEntityPosition(GetPlayerPed(target), false)
+                isFrozen[target] = nil
+                notify(source, 'Unfroze player ' .. target, 'success')
+            else
+                FreezeEntityPosition(GetPlayerPed(target), true)
+                isFrozen[target] = true
+                notify(source, 'Froze player ' .. target, 'success')
+            end
+        end
 
     elseif cmd == 'goto' then
         if source == 0 then return notify(source, 'Cannot use goto from console', 'error') end
@@ -302,12 +474,31 @@ RegisterCommand(config.prefix, function(source, args)
         local target = tonumber(args[2])
         if not target then return notify(source, 'Usage: cc goto <id>', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        local coords = GetEntityCoords(GetPlayerPed(target))
+        local targetPed = GetPlayerPed(target)
+        local targetVehicle = GetVehiclePedIsIn(targetPed, false)
         local targetBucket = GetPlayerRoutingBucket(target)
         if GetPlayerRoutingBucket(source) ~= targetBucket then
             SetPlayerRoutingBucket(source, targetBucket)
         end
-        SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
+        if targetVehicle and targetVehicle ~= 0 then
+            local netId = NetworkGetNetworkIdFromEntity(targetVehicle)
+            if netId and netId ~= 0 then
+                local seat = 1
+                for i = -1, GetVehicleMaxNumberOfPassengers(targetVehicle) - 1 do
+                    if IsVehicleSeatFree(targetVehicle, i) then
+                        seat = i
+                        break
+                    end
+                end
+                TriggerClientEvent('cuppa_admin:client:warpIntoVehicle', source, netId, seat)
+            else
+                local coords = GetEntityCoords(targetPed)
+                SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
+            end
+        else
+            local coords = GetEntityCoords(targetPed)
+            SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
+        end
         notify(source, 'Teleported to player ' .. target, 'success')
 
     elseif cmd == 'bring' then
@@ -316,18 +507,25 @@ RegisterCommand(config.prefix, function(source, args)
         local target = tonumber(args[2])
         if not target then return notify(source, 'Usage: cc bring <id>', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        local coords = GetEntityCoords(GetPlayerPed(source))
+        local sourceCoords = GetEntityCoords(GetPlayerPed(source))
         local sourceBucket = GetPlayerRoutingBucket(source)
         if GetPlayerRoutingBucket(target) ~= sourceBucket then
             SetPlayerRoutingBucket(target, sourceBucket)
         end
-        SetEntityCoords(GetPlayerPed(target), coords.x, coords.y, coords.z, false, false, false, false)
-        notify(source, 'Brought player ' .. target, 'success')
+        local targetPed = GetPlayerPed(target)
+        local targetVehicle = GetVehiclePedIsIn(targetPed, false)
+        if targetVehicle and targetVehicle ~= 0 then
+            TriggerClientEvent('cuppa_admin:client:bringVehicle', target, { x = sourceCoords.x, y = sourceCoords.y, z = sourceCoords.z, w = GetEntityHeading(GetPlayerPed(source)) })
+        else
+            SetEntityCoords(targetPed, sourceCoords.x, sourceCoords.y, sourceCoords.z, false, false, false, false)
+        end
+        notify(source, 'Brought player ' .. target .. (targetVehicle and targetVehicle ~= 0 and ' (with vehicle)' or ''), 'success')
 
-    elseif cmd == 'vehicle' then
-        if not hasPermission(source, 'vehicle') then return notify(source, 'No permission', 'error') end
+    elseif cmd == 'car' then
+        if not hasPermission(source, 'car') then return notify(source, 'No permission', 'error') end
         local model = args[2]
-        if not model then return notify(source, 'Usage: cc vehicle <model> [id]', 'error') end
+        if not model then return notify(source, 'Usage: cc car <model> [id]', 'error') end
+        if not isValidModel(model) then return notify(source, 'Invalid vehicle model: ' .. model, 'error') end
         local target = getTarget(source, args[3]) or source
         if target == 0 then return notify(source, 'Console requires a player ID', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
@@ -347,11 +545,12 @@ RegisterCommand(config.prefix, function(source, args)
 
     elseif cmd == 'dv' then
         if not hasPermission(source, 'dv') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2]) or source
+        local radius = tonumber(args[2])
+        local target = getTarget(source, args[3]) or source
         if target == 0 then return notify(source, 'Console requires a player ID', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        local radius = tonumber(args[3])
         if radius then
+            radius = math.min(radius, MAX_DV_RADIUS)
             local coords = GetEntityCoords(GetPlayerPed(target))
             local vehicles = GetGamePool('CVehicle')
             local count = 0
@@ -370,64 +569,85 @@ RegisterCommand(config.prefix, function(source, args)
 
     elseif cmd == 'giveitem' then
         if not hasPermission(source, 'giveitem') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local item = args[3]
-        local count = tonumber(args[4]) or 1
-        if not item then return notify(source, 'Usage: cc giveitem <id> <item> [amount]', 'error') end
+        if #args < 3 then return notify(source, 'Usage: cc giveitem <item> [amount] <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc giveitem <item> [amount] <id>', 'error') end
+        local item = args[2]
+        local count = #args > 3 and math.max(1, math.min(MAX_GIVEITEM, tonumber(args[3]) or 1)) or 1
+        if not item:match('^[%w_]+$') then return notify(source, 'Invalid item name', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
         exports.ox_inventory:AddItem(target, item, count)
         notify(source, 'Gave ' .. count .. 'x ' .. item .. ' to player ' .. target, 'success')
 
     elseif cmd == 'setjob' then
         if not hasPermission(source, 'setjob') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local job = args[3]
-        local grade = tonumber(args[4]) or 0
-        if not job then return notify(source, 'Usage: cc setjob <id> <job> [grade]', 'error') end
+        if #args < 3 then return notify(source, 'Usage: cc setjob <job> [grade] <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc setjob <job> [grade] <id>', 'error') end
+        local job = args[2]
+        local grade = #args > 3 and tonumber(args[3]) or 0
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local jobs = exports.qbx_core:GetJobs()
+        if not jobs[job] then return notify(source, 'Invalid job: ' .. job, 'error') end
+        local player = exports.qbx_core:GetPlayer(target)
+        saveUndo(target, 'setjob', { job = player.PlayerData.job.name, grade = player.PlayerData.job.grade.level })
         exports.qbx_core:SetJob(target, job, grade)
         notify(source, 'Set player ' .. target .. ' job to ' .. job .. ' grade ' .. grade, 'success')
 
     elseif cmd == 'setgang' then
         if not hasPermission(source, 'setgang') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local gang = args[3]
-        local grade = tonumber(args[4]) or 0
-        if not gang then return notify(source, 'Usage: cc setgang <id> <gang> [grade]', 'error') end
+        if #args < 3 then return notify(source, 'Usage: cc setgang <gang> [grade] <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc setgang <gang> [grade] <id>', 'error') end
+        local gang = args[2]
+        local grade = #args > 3 and tonumber(args[3]) or 0
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local gangs = exports.qbx_core:GetGangs()
+        if not gangs[gang] then return notify(source, 'Invalid gang: ' .. gang, 'error') end
+        local player = exports.qbx_core:GetPlayer(target)
+        saveUndo(target, 'setgang', { gang = player.PlayerData.gang.name, grade = player.PlayerData.gang.grade.level })
         exports.qbx_core:SetGang(target, gang, grade)
         notify(source, 'Set player ' .. target .. ' gang to ' .. gang .. ' grade ' .. grade, 'success')
 
     elseif cmd == 'givecash' then
         if not hasPermission(source, 'givecash') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local amount = tonumber(args[3])
-        if not amount then return notify(source, 'Usage: cc givecash <id> <amount>', 'error') end
+        if #args < 3 then return notify(source, 'Usage: cc givecash <amount> <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc givecash <amount> <id>', 'error') end
+        local amount = tonumber(args[2])
+        if not amount or amount <= 0 or amount > MAX_MONEY then return notify(source, 'Amount must be 1-' .. MAX_MONEY, 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local player = exports.qbx_core:GetPlayer(target)
+        saveUndo(target, 'givecash', { amount = player.PlayerData.money.cash })
         exports.qbx_core:AddMoney(target, 'cash', amount, 'cuppa_admin')
         notify(source, 'Gave $' .. amount .. ' cash to player ' .. target, 'success')
 
     elseif cmd == 'givebank' then
         if not hasPermission(source, 'givebank') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
-        if not target then return end
-        local amount = tonumber(args[3])
-        if not amount then return notify(source, 'Usage: cc givebank <id> <amount>', 'error') end
+        if #args < 3 then return notify(source, 'Usage: cc givebank <amount> <id>', 'error') end
+        local target = tonumber(args[#args])
+        if not target then return notify(source, 'Usage: cc givebank <amount> <id>', 'error') end
+        local amount = tonumber(args[2])
+        if not amount or amount <= 0 or amount > MAX_MONEY then return notify(source, 'Amount must be 1-' .. MAX_MONEY, 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local player = exports.qbx_core:GetPlayer(target)
+        saveUndo(target, 'givebank', { amount = player.PlayerData.money.bank })
         exports.qbx_core:AddMoney(target, 'bank', amount, 'cuppa_admin')
         notify(source, 'Gave $' .. amount .. ' bank to player ' .. target, 'success')
 
     elseif cmd == 'armor' then
         if not hasPermission(source, 'armor') then return notify(source, 'No permission', 'error') end
-        local target = getTarget(source, args[2])
+        local target = getTarget(source, #args >= 3 and args[3] or args[2])
         if not target then return end
-        local amount = tonumber(args[3]) or 100
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local amount
+        if #args >= 3 then
+            amount = math.max(0, math.min(100, tonumber(args[2]) or 100))
+        else
+            amount = 100
+        end
         local player = exports.qbx_core:GetPlayer(target)
+        saveUndo(target, 'armor', { amount = player.PlayerData.metadata.armor or 0 })
         player.Functions.SetMetaData('armor', amount)
         SetPedArmour(GetPlayerPed(target), amount)
         notify(source, 'Set player ' .. target .. ' armor to ' .. amount, 'success')
@@ -436,9 +656,12 @@ RegisterCommand(config.prefix, function(source, args)
         if not hasPermission(source, 'setmodel') then return notify(source, 'No permission', 'error') end
         local model = args[2]
         if not model then return notify(source, 'Usage: cc setmodel <model> [id]', 'error') end
+        if not isValidModel(model) then return notify(source, 'Invalid ped model: ' .. model, 'error') end
         local target = getTarget(source, args[3]) or (source == 0 and nil or source)
         if not target then return notify(source, 'Usage: cc setmodel <model> [id]', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local currentModel = GetEntityModel(GetPlayerPed(target))
+        saveUndo(target, 'setmodel', { model = currentModel })
         TriggerClientEvent('cuppa_admin:client:setModel', target, model)
         notify(source, 'Set player ' .. target .. ' model to ' .. model, 'success')
 
@@ -469,7 +692,6 @@ RegisterCommand(config.prefix, function(source, args)
             if not hasPermission(source, 'tp') then return notify(source, 'No permission', 'error') end
             local targetA = tonumber(args[2])
             local targetB = tonumber(args[3])
-            -- cc tp <id> — teleport self to player
             if targetA and not targetB then
                 if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player not found', 'error') end
                 local coords = GetEntityCoords(GetPlayerPed(targetA))
@@ -479,7 +701,6 @@ RegisterCommand(config.prefix, function(source, args)
                 end
                 SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
                 notify(source, 'Teleported to player ' .. targetA, 'success')
-            -- cc tp <id> <id> — teleport player A to player B
             elseif targetA and targetB then
                 if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player ' .. targetA .. ' not found', 'error') end
                 if not exports.qbx_core:GetPlayer(targetB) then return notify(source, 'Player ' .. targetB .. ' not found', 'error') end
@@ -508,18 +729,16 @@ RegisterCommand(config.prefix, function(source, args)
         if source == 0 then return notify(source, 'Cannot use visible from console', 'error') end
         local target = tonumber(args[2])
         if not target then
-            -- No args: toggle my own visibility to all players
             TriggerClientEvent('cuppa_admin:client:visibleGlobal', -1, source)
         else
             if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-            -- With args: toggle player visibility on my screen
             TriggerClientEvent('cuppa_admin:client:visible', source, target)
         end
 
     elseif cmd == 'hide' then
         if not hasPermission(source, 'hide') then return notify(source, 'No permission', 'error') end
         if source == 0 then return notify(source, 'Cannot use hide from console', 'error') end
-        local exceptionId = tonumber(args[1])
+        local exceptionId = tonumber(args[2])
         if not exceptionId then return notify(source, 'Usage: cc hide <id>', 'error') end
         if not exports.qbx_core:GetPlayer(exceptionId) then return notify(source, 'Player not found', 'error') end
         if exceptionId == source then return notify(source, 'Cannot hide from yourself', 'error') end
@@ -562,7 +781,7 @@ RegisterCommand(config.prefix, function(source, args)
         if source == 0 then return notify(source, 'Cannot use bucket from console', 'error') end
         local sub = args[2]
 
-        if sub == 'add' then
+        if not sub then
             local bucketId = bucketState[source]
             if not bucketId then
                 bucketId = source
@@ -573,56 +792,27 @@ RegisterCommand(config.prefix, function(source, args)
                 bucketMembers[bucketId][source] = true
                 local adminLicense = getLicense(source)
                 if adminLicense then bucketLicenses[adminLicense] = bucketId end
-            end
-
-            local added = 0
-            for i = 3, #args do
-                local target = tonumber(args[i])
-                if target then
-                    if not exports.qbx_core:GetPlayer(target) then
-                        notify(source, 'Player ' .. target .. ' not found, skipping', 'error')
-                    elseif bucketMembers[bucketId][target] then
-                        notify(source, 'Player ' .. target .. ' is already in bucket #' .. bucketId, 'error')
-                    else
-                        SetPlayerRoutingBucket(target, bucketId)
-                        bucketMembers[bucketId][target] = true
-                        bucketState[target] = bucketId
-                        local targetLicense = getLicense(target)
-                        if targetLicense then bucketLicenses[targetLicense] = bucketId end
-                        added = added + 1
-                    end
-                end
-            end
-
-            local memberCount = 0
-            for _ in pairs(bucketMembers[bucketId]) do memberCount = memberCount + 1 end
-            if added > 0 then
-                notify(source, ('Added %d player(s) to bucket #%d — %d player(s) total'):format(added, bucketId, memberCount), 'success')
+                notify(source, ('Created and joined bucket #%d'):format(bucketId), 'success')
             else
-                notify(source, ('You are now in bucket #%d — %d player(s) total'):format(bucketId, memberCount), 'success')
-            end
-
-        elseif sub == 'leave' then
-            local bucketId = bucketState[source]
-            if not bucketId then return notify(source, 'You are not in a bucket', 'error') end
-            SetPlayerRoutingBucket(source, 0)
-            bucketState[source] = nil
-            local license = getLicense(source)
-            if license then bucketLicenses[license] = nil end
-            if bucketMembers[bucketId] then
-                bucketMembers[bucketId][source] = nil
-                if not next(bucketMembers[bucketId]) then
-                    bucketMembers[bucketId] = nil
-                    bucketAdmin[bucketId] = nil
+                local lines = {}
+                local adminId = bucketAdmin[bucketId]
+                local adminName = adminId and GetPlayerName(adminId) or 'Unknown'
+                table.insert(lines, ('Bucket #%d (Admin: %s)'):format(bucketId, adminName))
+                for memberId in pairs(bucketMembers[bucketId]) do
+                    local name = GetPlayerName(memberId) or 'Unknown'
+                    table.insert(lines, ('  - [%d] %s'):format(memberId, name))
                 end
+                for _, line in ipairs(lines) do
+                    print('[cuppa_admin] ' .. line)
+                end
+                notify(source, 'Bucket status printed to console', 'inform')
             end
-            notify(source, 'Left bucket #' .. bucketId .. ' — returned to main world', 'success')
 
-        elseif sub == 'kick' then
+        elseif sub:sub(1, 1) == '-' then
+            local target = tonumber(sub:sub(2))
+            if not target then return notify(source, 'Usage: cc bucket -<id>', 'error') end
             local bucketId = bucketState[source]
             if not bucketId then return notify(source, 'You are not in a bucket', 'error') end
-            local target = tonumber(args[3])
-            if not target then return notify(source, 'Usage: cc bucket kick <id>', 'error') end
             if not bucketMembers[bucketId] or not bucketMembers[bucketId][target] then
                 return notify(source, 'Player ' .. target .. ' is not in your bucket', 'error')
             end
@@ -631,12 +821,13 @@ RegisterCommand(config.prefix, function(source, args)
             bucketState[target] = nil
             local targetLicense = getLicense(target)
             if targetLicense then bucketLicenses[targetLicense] = nil end
-            notify(source, 'Kicked player ' .. target .. ' from bucket #' .. bucketId, 'success')
+            notify(source, 'Removed player ' .. target .. ' from bucket #' .. bucketId, 'success')
 
-        elseif sub == 'rm' then
-            local targetBucket = tonumber(args[3])
-            if not targetBucket then return notify(source, 'Usage: cc bucket rm <bucket id>', 'error') end
+        elseif sub == 'destroy' then
+            local targetBucket = tonumber(args[3]) or bucketState[source]
+            if not targetBucket then return notify(source, 'You are not in a bucket', 'error') end
             if not bucketMembers[targetBucket] then return notify(source, 'Bucket #' .. targetBucket .. ' does not exist', 'error') end
+            if bucketAdmin[targetBucket] ~= source then return notify(source, 'You can only destroy your own bucket', 'error') end
             local count = 0
             for memberId in pairs(bucketMembers[targetBucket]) do
                 SetPlayerRoutingBucket(memberId, 0)
@@ -648,30 +839,6 @@ RegisterCommand(config.prefix, function(source, args)
             bucketMembers[targetBucket] = nil
             bucketAdmin[targetBucket] = nil
             notify(source, 'Bucket #' .. targetBucket .. ' dissolved — ' .. count .. ' player(s) returned to main world', 'success')
-
-        elseif sub == 'status' then
-            local found = false
-            local lines = {}
-            for bId, members in pairs(bucketMembers) do
-                found = true
-                local adminId = bucketAdmin[bId]
-                local adminName = adminId and GetPlayerName(adminId) or 'Unknown'
-                table.insert(lines, ('Bucket #%d (Admin: %s)'):format(bId, adminName))
-                for memberId in pairs(members) do
-                    local name = GetPlayerName(memberId) or 'Unknown'
-                    table.insert(lines, ('  - [%d] %s'):format(memberId, name))
-                end
-                table.insert(lines, '')
-            end
-            if not found then
-                notify(source, 'No active buckets', 'inform')
-            else
-                print('^2[cuppa_admin] Active Buckets:^0')
-                for _, line in ipairs(lines) do
-                    print('  ' .. line)
-                end
-                notify(source, 'Bucket status printed to console', 'inform')
-            end
 
         elseif sub == 'wipe' then
             local totalPlayers = 0
@@ -696,13 +863,56 @@ RegisterCommand(config.prefix, function(source, args)
             end
 
         else
-            notify(source, 'Usage: cc bucket <add|leave|kick|rm|status|wipe>', 'error')
+            local target = tonumber(sub)
+            if not target then return notify(source, 'Usage: cc bucket <id> | cc bucket -<id> | cc bucket destroy | cc bucket wipe', 'error') end
+            local bucketId = bucketState[source]
+            if not bucketId then
+                bucketId = source
+                bucketState[source] = bucketId
+                bucketMembers[bucketId] = {}
+                bucketAdmin[bucketId] = source
+                SetPlayerRoutingBucket(source, bucketId)
+                bucketMembers[bucketId][source] = true
+                local adminLicense = getLicense(source)
+                if adminLicense then bucketLicenses[adminLicense] = bucketId end
+            end
+            if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+            if bucketMembers[bucketId][target] then
+                return notify(source, 'Player ' .. target .. ' is already in bucket #' .. bucketId, 'error')
+            end
+            SetPlayerRoutingBucket(target, bucketId)
+            bucketMembers[bucketId][target] = true
+            bucketState[target] = bucketId
+            local targetLicense = getLicense(target)
+            if targetLicense then bucketLicenses[targetLicense] = bucketId end
+            local memberCount = 0
+            for _ in pairs(bucketMembers[bucketId]) do memberCount = memberCount + 1 end
+            notify(source, ('Added player %d to bucket #%d — %d player(s) total'):format(target, bucketId, memberCount), 'success')
         end
 
     else
-        notify(source, 'Unknown command: cc ' .. cmd .. ' — run "cc help" for commands', 'error')
+        notify(source, 'Unknown command: cc ' .. cmd .. ' — run "cc" for commands', 'error')
     end
+end
+
+RegisterCommand(config.prefix, function(source, args)
+    handleCommand(source, args)
 end, false)
+
+--- Execute a command string as if typed in console. Returns captured output.
+---@param cmdStr string Full command string (e.g. "kick 5" or "giveitem bread 3 5")
+---@return string output
+function executeCommand(cmdStr)
+    local args = {}
+    for word in cmdStr:gmatch('%S+') do
+        args[#args + 1] = word
+    end
+    commandOutput = ''
+    handleCommand(0, args)
+    local output = commandOutput
+    commandOutput = nil
+    return output
+end
 
 AddEventHandler('playerDropped', function()
     local source = source
