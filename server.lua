@@ -13,14 +13,9 @@ local MAX_DV_RADIUS = 500
 local MAX_GIVEITEM = 9999
 local commandOutput = nil -- set by executeCommand to capture notify() output
 
-local validModels = {}
 local function isValidModel(model)
-    if validModels[model] ~= nil then return validModels[model] end
     local hash = joaat(model)
-    local success = pcall(function() RequestModel(hash) end)
-    validModels[model] = success and IsModelValid(hash) or false
-    if validModels[model] then SetModelAsNoLongerNeeded(hash) end
-    return validModels[model]
+    return hash ~= 0
 end
 
 local function getLicense(source)
@@ -33,6 +28,43 @@ if GetResourceState('wasabi_ambulance_v2') == 'started' then
 elseif GetResourceState('qbx_medical') == 'started' then
     medicalResource = 'qbx'
 end
+
+local REFUND_CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+local REFUND_EXPIRY = 86400 -- 24 hours
+
+local function generateRefundCode()
+    math.randomseed(os.time() + math.random(1000, 9999))
+    local code = ''
+    for i = 1, 6 do
+        local idx = math.random(1, #REFUND_CODE_CHARS)
+        code = code .. REFUND_CODE_CHARS:sub(idx, idx)
+    end
+    return code
+end
+
+-- Create refunds table + clean expired on startup
+MySQL.ready(function()
+    MySQL.query.await([[
+        CREATE TABLE IF NOT EXISTS refunds (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            code VARCHAR(8) NOT NULL UNIQUE,
+            admin_name VARCHAR(100) DEFAULT 'Console',
+            items LONGTEXT NOT NULL,
+            created_at INT NOT NULL,
+            expires_at INT NOT NULL,
+            claimed_by VARCHAR(200) DEFAULT NULL,
+            claimed_at INT DEFAULT NULL,
+            active TINYINT(1) DEFAULT 1
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ]])
+    MySQL.query.await('UPDATE refunds SET active = 0 WHERE expires_at < ? AND active = 1', { os.time() })
+    print('^2[cuppa_admin] Refunds table ready^0')
+end)
+
+-- Periodic expiry cleanup (every 10 minutes)
+SetTimeout(600000, function()
+    MySQL.query('UPDATE refunds SET active = 0 WHERE expires_at < ? AND active = 1', { os.time() })
+end)
 
 local function revivePlayer(target)
     if medicalResource == 'wasabi' then
@@ -222,6 +254,17 @@ local function showHelp(source)
         {'cc bucket -<id>',                   'Remove player from your bucket'},
         {'cc bucket destroy [id]',            'Dissolve your bucket (or by ID)'},
         {'cc bucket wipe',                    'Destroy ALL buckets'},
+        {'cc terminal',                       'Toggle admin terminal GUI (in-game only)'},
+        {'cc inventory <id>',                 'View a player\'s inventory'},
+        {'cc vec2',                           'Copy vector2 coords to clipboard (in-game)'},
+        {'cc vec3',                           'Copy vector3 coords to clipboard (in-game)'},
+        {'cc vec4',                           'Copy vector4 coords + heading to clipboard (in-game)'},
+        {'cc heading',                        'Copy heading to clipboard (in-game)'},
+        {'cc names',                          'Toggle player names above heads'},
+        {'cc blips',                          'Toggle player blips on map'},
+        {'cc refundlist',                     'List all active refunds'},
+        {'cc refundrevoke <code>',            'Revoke a refund by code'},
+        {'/refund <code>',                    'Claim a refund using your code'},
     }
     print('^2[cuppa_admin] Available Commands:^0')
     for _, cmd in ipairs(cmds) do
@@ -240,11 +283,15 @@ end
 local function listPlayers(source)
     if not hasPermission(source, 'list') then return notify(source, 'No permission', 'error') end
     local players = exports.qbx_core:GetQBPlayers()
-    print('^2[cuppa_admin] Online Players:^0')
+    local lines = { '--- Online Players ---' }
     for id, player in pairs(players) do
         local name = player.PlayerData.charinfo.firstname .. ' ' .. player.PlayerData.charinfo.lastname
         local job = player.PlayerData.job.label
-        print(('  ID: %s | Name: %s | Job: %s'):format(id, name, job))
+        lines[#lines + 1] = ('  ID: %s | Name: %s | Job: %s'):format(id, name, job)
+    end
+    lines[#lines + 1] = ('Total: %d player(s)'):format(#lines - 1)
+    for _, line in ipairs(lines) do
+        notify(source, line, 'inform')
     end
 end
 
@@ -458,11 +505,11 @@ local function handleCommand(source, args)
             if not target then return end
             if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
             if isFrozen[target] then
-                FreezeEntityPosition(GetPlayerPed(target), false)
+                TriggerClientEvent('cuppa_admin:client:freeze', target, false)
                 isFrozen[target] = nil
                 notify(source, 'Unfroze player ' .. target, 'success')
             else
-                FreezeEntityPosition(GetPlayerPed(target), true)
+                TriggerClientEvent('cuppa_admin:client:freeze', target, true)
                 isFrozen[target] = true
                 notify(source, 'Froze player ' .. target, 'success')
             end
@@ -474,31 +521,11 @@ local function handleCommand(source, args)
         local target = tonumber(args[2])
         if not target then return notify(source, 'Usage: cc goto <id>', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
-        local targetPed = GetPlayerPed(target)
-        local targetVehicle = GetVehiclePedIsIn(targetPed, false)
         local targetBucket = GetPlayerRoutingBucket(target)
         if GetPlayerRoutingBucket(source) ~= targetBucket then
             SetPlayerRoutingBucket(source, targetBucket)
         end
-        if targetVehicle and targetVehicle ~= 0 then
-            local netId = NetworkGetNetworkIdFromEntity(targetVehicle)
-            if netId and netId ~= 0 then
-                local seat = 1
-                for i = -1, GetVehicleMaxNumberOfPassengers(targetVehicle) - 1 do
-                    if IsVehicleSeatFree(targetVehicle, i) then
-                        seat = i
-                        break
-                    end
-                end
-                TriggerClientEvent('cuppa_admin:client:warpIntoVehicle', source, netId, seat)
-            else
-                local coords = GetEntityCoords(targetPed)
-                SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
-            end
-        else
-            local coords = GetEntityCoords(targetPed)
-            SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
-        end
+        TriggerClientEvent('cuppa_admin:client:goto', source, target)
         notify(source, 'Teleported to player ' .. target, 'success')
 
     elseif cmd == 'bring' then
@@ -512,14 +539,8 @@ local function handleCommand(source, args)
         if GetPlayerRoutingBucket(target) ~= sourceBucket then
             SetPlayerRoutingBucket(target, sourceBucket)
         end
-        local targetPed = GetPlayerPed(target)
-        local targetVehicle = GetVehiclePedIsIn(targetPed, false)
-        if targetVehicle and targetVehicle ~= 0 then
-            TriggerClientEvent('cuppa_admin:client:bringVehicle', target, { x = sourceCoords.x, y = sourceCoords.y, z = sourceCoords.z, w = GetEntityHeading(GetPlayerPed(source)) })
-        else
-            SetEntityCoords(targetPed, sourceCoords.x, sourceCoords.y, sourceCoords.z, false, false, false, false)
-        end
-        notify(source, 'Brought player ' .. target .. (targetVehicle and targetVehicle ~= 0 and ' (with vehicle)' or ''), 'success')
+        TriggerClientEvent('cuppa_admin:client:bring', target, { x = sourceCoords.x, y = sourceCoords.y, z = sourceCoords.z, w = GetEntityHeading(GetPlayerPed(source)) })
+        notify(source, 'Brought player ' .. target, 'success')
 
     elseif cmd == 'car' then
         if not hasPermission(source, 'car') then return notify(source, 'No permission', 'error') end
@@ -545,12 +566,28 @@ local function handleCommand(source, args)
 
     elseif cmd == 'dv' then
         if not hasPermission(source, 'dv') then return notify(source, 'No permission', 'error') end
-        local radius = tonumber(args[2])
-        local target = getTarget(source, args[3]) or source
+        local arg2 = tonumber(args[2])
+        local arg3 = tonumber(args[3])
+        -- If only one arg: check if it's a player ID (no vehicle near = radius would be meaningless)
+        -- If two args: first is radius, second is player ID
+        local radius, target
+        if arg2 and arg3 then
+            radius = math.min(arg2, MAX_DV_RADIUS)
+            target = arg3
+        elseif arg2 then
+            -- Single arg: try as player ID first, fallback to radius with self as target
+            if exports.qbx_core:GetPlayer(arg2) then
+                target = arg2
+            else
+                radius = math.min(arg2, MAX_DV_RADIUS)
+                target = source
+            end
+        else
+            target = source
+        end
         if target == 0 then return notify(source, 'Console requires a player ID', 'error') end
         if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
         if radius then
-            radius = math.min(radius, MAX_DV_RADIUS)
             local coords = GetEntityCoords(GetPlayerPed(target))
             local vehicles = GetGamePool('CVehicle')
             local count = 0
@@ -686,7 +723,7 @@ local function handleCommand(source, args)
             if GetPlayerRoutingBucket(targetA) ~= targetBucket then
                 SetPlayerRoutingBucket(targetA, targetBucket)
             end
-            SetEntityCoords(GetPlayerPed(targetA), coords.x, coords.y, coords.z, false, false, false, false)
+            TriggerClientEvent('cuppa_admin:client:tpToCoords', targetA, coords)
             notify(source, 'Teleported player ' .. targetA .. ' to player ' .. targetB, 'success')
         else
             if not hasPermission(source, 'tp') then return notify(source, 'No permission', 'error') end
@@ -699,7 +736,7 @@ local function handleCommand(source, args)
                 if GetPlayerRoutingBucket(source) ~= targetBucket then
                     SetPlayerRoutingBucket(source, targetBucket)
                 end
-                SetEntityCoords(GetPlayerPed(source), coords.x, coords.y, coords.z, false, false, false, false)
+                TriggerClientEvent('cuppa_admin:client:goto', source, targetA)
                 notify(source, 'Teleported to player ' .. targetA, 'success')
             elseif targetA and targetB then
                 if not exports.qbx_core:GetPlayer(targetA) then return notify(source, 'Player ' .. targetA .. ' not found', 'error') end
@@ -709,7 +746,7 @@ local function handleCommand(source, args)
                 if GetPlayerRoutingBucket(targetA) ~= targetBucket then
                     SetPlayerRoutingBucket(targetA, targetBucket)
                 end
-                SetEntityCoords(GetPlayerPed(targetA), coords.x, coords.y, coords.z, false, false, false, false)
+                TriggerClientEvent('cuppa_admin:client:tpToCoords', targetA, coords)
                 notify(source, 'Teleported player ' .. targetA .. ' to player ' .. targetB, 'success')
             else
                 return notify(source, 'Usage: cc tp <id> [id]', 'error')
@@ -775,6 +812,64 @@ local function handleCommand(source, args)
 
         TriggerClientEvent('cuppa_admin:client:showSelf', source)
         notify(source, 'Visibility restored', 'success')
+
+    elseif cmd == 'terminal' then
+        if source == 0 then return notify(source, 'Cannot use terminal from console', 'error') end
+        if not hasPermission(source, 'terminal') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:terminalToggle', source)
+
+    elseif cmd == 'inventory' then
+        if not hasPermission(source, 'inventory') then return notify(source, 'No permission', 'error') end
+        local target = tonumber(args[2])
+        if not target then return notify(source, 'Usage: cc inventory <id>', 'error') end
+        if not exports.qbx_core:GetPlayer(target) then return notify(source, 'Player not found', 'error') end
+        local items = exports.ox_inventory:GetInventoryItems(target)
+        if not items or not next(items) then
+            notify(source, 'Player ' .. target .. ' has no items', 'inform')
+        else
+            print('^2[cuppa_admin] Inventory for player ' .. target .. ':^0')
+            local totalSlots = 0
+            for _, item in pairs(items) do
+                if item.slot then totalSlots = math.max(totalSlots, item.slot) end
+                local label = item.label or item.name
+                print(('  Slot %s | %s (%s) x%d'):format(item.slot or '?', label, item.name, item.count or 0))
+            end
+            notify(source, 'Inventory printed to console (' .. #items .. ' items)', 'inform')
+        end
+
+    elseif cmd == 'vec2' then
+        if source == 0 then return notify(source, 'Cannot use vec2 from console', 'error') end
+        if not hasPermission(source, 'dev') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:copyCoords', source, 'vec2')
+        notify(source, 'Copying vector2 to clipboard...', 'inform')
+
+    elseif cmd == 'vec3' then
+        if source == 0 then return notify(source, 'Cannot use vec3 from console', 'error') end
+        if not hasPermission(source, 'dev') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:copyCoords', source, 'vec3')
+        notify(source, 'Copying vector3 to clipboard...', 'inform')
+
+    elseif cmd == 'vec4' then
+        if source == 0 then return notify(source, 'Cannot use vec4 from console', 'error') end
+        if not hasPermission(source, 'dev') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:copyCoords', source, 'vec4')
+        notify(source, 'Copying vector4 to clipboard...', 'inform')
+
+    elseif cmd == 'heading' then
+        if source == 0 then return notify(source, 'Cannot use heading from console', 'error') end
+        if not hasPermission(source, 'dev') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:copyCoords', source, 'heading')
+        notify(source, 'Copying heading to clipboard...', 'inform')
+
+    elseif cmd == 'names' then
+        if source == 0 then return notify(source, 'Cannot use names from console', 'error') end
+        if not hasPermission(source, 'names') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:names', source)
+
+    elseif cmd == 'blips' then
+        if source == 0 then return notify(source, 'Cannot use blips from console', 'error') end
+        if not hasPermission(source, 'blips') then return notify(source, 'No permission', 'error') end
+        TriggerClientEvent('cuppa_admin:client:blips', source)
 
     elseif cmd == 'bucket' then
         if not hasPermission(source, 'bucket') then return notify(source, 'No permission', 'error') end
@@ -890,6 +985,39 @@ local function handleCommand(source, args)
             notify(source, ('Added player %d to bucket #%d — %d player(s) total'):format(target, bucketId, memberCount), 'success')
         end
 
+    elseif cmd == 'refundlist' then
+        if not hasPermission(source, 'refundlist') then return notify(source, 'No permission', 'error') end
+        MySQL.query('SELECT code, admin_name, items, created_at, expires_at, claimed_by FROM refunds WHERE active = 1 AND claimed_by IS NULL AND expires_at > ? ORDER BY created_at DESC', { os.time() }, function(rows)
+            if not rows or #rows == 0 then
+                notify(source, 'No active refunds', 'inform')
+                return
+            end
+            print('^2[cuppa_admin] Active Refunds:^0')
+            for _, r in ipairs(rows) do
+                local items = json.decode(r.items)
+                local count = 0
+                for _, it in ipairs(items) do count = count + (it.count or 1) end
+                local remaining = r.expires_at - os.time()
+                local hours = math.floor(remaining / 3600)
+                local mins = math.floor((remaining % 3600) / 60)
+                print(('  ^3%s^0 | %d item(s) | by %s | expires in %dh %dm'):format(r.code, count, r.admin_name, hours, mins))
+            end
+            print('')
+        end)
+
+    elseif cmd == 'refundrevoke' then
+        if not hasPermission(source, 'refundlist') then return notify(source, 'No permission', 'error') end
+        local code = args[2] and args[2]:upper() or nil
+        if not code then return notify(source, 'Usage: cc refundrevoke <code>', 'error') end
+        MySQL.update('UPDATE refunds SET active = 0 WHERE code = ? AND active = 1 AND claimed_by IS NULL', { code }, function(affected)
+            if affected and affected > 0 then
+                logAdminAction('Refund Revoked', 'Code: ' .. code, source == 0 and 'Console' or GetPlayerName(source))
+                notify(source, 'Revoked refund: ' .. code, 'success')
+            else
+                notify(source, 'Refund not found or already used/expired', 'error')
+            end
+        end)
+
     else
         notify(source, 'Unknown command: cc ' .. cmd .. ' — run "cc" for commands', 'error')
     end
@@ -901,14 +1029,15 @@ end, false)
 
 --- Execute a command string as if typed in console. Returns captured output.
 ---@param cmdStr string Full command string (e.g. "kick 5" or "giveitem bread 3 5")
+---@param execSource number|nil Player source to execute as (nil = console)
 ---@return string output
-function executeCommand(cmdStr)
+function executeCommand(cmdStr, execSource)
     local args = {}
     for word in cmdStr:gmatch('%S+') do
         args[#args + 1] = word
     end
     commandOutput = ''
-    handleCommand(0, args)
+    handleCommand(execSource or 0, args)
     local output = commandOutput
     commandOutput = nil
     return output
@@ -945,4 +1074,355 @@ AddEventHandler('playerJoining', function()
         bucketMembers[bucketId] = bucketMembers[bucketId] or {}
         bucketMembers[bucketId][source] = true
     end
+end)
+
+-- ── Terminal GUI events ──
+
+RegisterNetEvent('cuppa_admin:server:requestTerminal', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then
+        TriggerClientEvent('cuppa_admin:client:terminalOutput', source, 'No permission')
+        return
+    end
+    TriggerClientEvent('cuppa_admin:client:terminalOpen', source)
+end)
+
+RegisterNetEvent('cuppa_admin:server:terminalCmd', function(cmdStr)
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local output = executeCommand(cmdStr, source)
+    if output and output ~= '' then
+        TriggerClientEvent('cuppa_admin:client:terminalOutput', source, output)
+    end
+end)
+
+RegisterNetEvent('cuppa_admin:server:requestPlayerList', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local players = exports.qbx_core:GetQBPlayers()
+    local list = {}
+    for id, player in pairs(players) do
+        local idNum = tonumber(id)
+        local ped = GetPlayerPed(idNum)
+        list[#list + 1] = {
+            id = idNum,
+            name = player.PlayerData.charinfo.firstname .. ' ' .. player.PlayerData.charinfo.lastname,
+            job = player.PlayerData.job.label,
+            jobGrade = player.PlayerData.job.grade.name or ('Grade ' .. player.PlayerData.job.grade.level),
+            gang = player.PlayerData.gang.name ~= 'none' and player.PlayerData.gang.label or nil,
+            cash = player.PlayerData.money.cash,
+            bank = player.PlayerData.money.bank,
+            health = ped and GetEntityHealth(ped) or 200,
+            armor = player.PlayerData.metadata.armor or 0,
+        }
+    end
+    TriggerClientEvent('cuppa_admin:client:playerList', source, list)
+end)
+
+RegisterNetEvent('cuppa_admin:server:requestInventory', function(targetId)
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    if not exports.qbx_core:GetPlayer(targetId) then
+        TriggerClientEvent('cuppa_admin:client:inventoryResult', source, nil, 'Player not found')
+        return
+    end
+    local items = exports.ox_inventory:GetInventoryItems(targetId)
+    local list = {}
+    if items then
+        for _, item in pairs(items) do
+            list[#list + 1] = {
+                slot = item.slot,
+                name = item.name,
+                label = item.label or item.name,
+                count = item.count or 0,
+                weight = item.weight or 0,
+                metadata = item.metadata,
+            }
+        end
+    end
+    TriggerClientEvent('cuppa_admin:client:inventoryResult', source, list, nil)
+end)
+
+RegisterNetEvent('cuppa_admin:server:removeItem', function(data)
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local targetId = data.playerId
+    local slot = data.slot
+    local itemName = data.name
+    if not targetId or not slot or not itemName then return end
+    if not exports.qbx_core:GetPlayer(targetId) then
+        TriggerClientEvent('cuppa_admin:client:inventoryResult', source, nil, 'Player not found')
+        return
+    end
+    local ok = exports.ox_inventory:RemoveItem(targetId, itemName, 1, nil, slot)
+    if ok then
+        local items = exports.ox_inventory:GetInventoryItems(targetId)
+        local list = {}
+        if items then
+            for _, item in pairs(items) do
+                list[#list + 1] = {
+                    slot = item.slot,
+                    name = item.name,
+                    label = item.label or item.name,
+                    count = item.count or 0,
+                    weight = item.weight or 0,
+                    metadata = item.metadata,
+                }
+            end
+        end
+        TriggerClientEvent('cuppa_admin:client:inventoryResult', source, list, nil)
+    else
+        TriggerClientEvent('cuppa_admin:client:terminalOutput', source, 'Failed to remove item')
+    end
+end)
+
+-- ── Item/Job/Gang list for modal pickers ──
+
+RegisterNetEvent('cuppa_admin:server:getItems', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local allItems = exports.ox_inventory:Items()
+    local list = {}
+    if allItems then
+        for name, item in pairs(allItems) do
+            list[#list + 1] = {
+                name = name,
+                label = item.label or name,
+            }
+        end
+        table.sort(list, function(a, b) return a.label < b.label end)
+    end
+    TriggerClientEvent('cuppa_admin:client:itemList', source, list)
+end)
+
+RegisterNetEvent('cuppa_admin:server:getJobs', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local jobs = exports.qbx_core:GetJobs()
+    local list = {}
+    for name, job in pairs(jobs) do
+        list[#list + 1] = { name = name, label = job.label or name }
+    end
+    table.sort(list, function(a, b) return a.label < b.label end)
+    TriggerClientEvent('cuppa_admin:client:jobList', source, list)
+end)
+
+RegisterNetEvent('cuppa_admin:server:getGangs', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'terminal') then return end
+    local gangs = exports.qbx_core:GetGangs()
+    local list = {}
+    for name, gang in pairs(gangs) do
+        list[#list + 1] = { name = name, label = gang.label or name }
+    end
+    table.sort(list, function(a, b) return a.label < b.label end)
+    TriggerClientEvent('cuppa_admin:client:gangList', source, list)
+end)
+
+-- ── Refund System ──
+
+RegisterNetEvent('cuppa_admin:server:createRefund', function(data)
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'refund') then
+        TriggerClientEvent('cuppa_admin:client:refundCreated', source, nil, 'No permission')
+        return
+    end
+    local items = data.items
+    if not items or type(items) ~= 'table' or #items == 0 then
+        TriggerClientEvent('cuppa_admin:client:refundCreated', source, nil, 'No items provided')
+        return
+    end
+    for i, item in ipairs(items) do
+        if type(item) ~= 'table' or not item.name or not tostring(item.name):match('^[%w_]+$') then
+            TriggerClientEvent('cuppa_admin:client:refundCreated', source, nil, 'Invalid item at position ' .. i)
+            return
+        end
+        if not item.count or item.count < 1 then items[i].count = 1 end
+        if items[i].count > MAX_GIVEITEM then items[i].count = MAX_GIVEITEM end
+    end
+    -- try up to 5 times for unique code
+    local code = nil
+    for attempt = 1, 5 do
+        local candidate = generateRefundCode()
+        local exists = MySQL.scalar.await('SELECT COUNT(*) FROM refunds WHERE code = ?', { candidate })
+        if exists == 0 then
+            code = candidate
+            break
+        end
+    end
+    if not code then
+        TriggerClientEvent('cuppa_admin:client:refundCreated', source, nil, 'Failed to generate unique code')
+        return
+    end
+    local adminName = GetPlayerName(source) or 'Console'
+    local now = os.time()
+    MySQL.insert('INSERT INTO refunds (code, admin_name, items, created_at, expires_at, active) VALUES (?, ?, ?, ?, ?, 1)', {
+        code, adminName, json.encode(items), now, now + REFUND_EXPIRY
+    }, function(id)
+        if id then
+            logAdminAction('Refund Created', ('Code: %s | %d item(s)'):format(code, #items), adminName)
+            TriggerClientEvent('cuppa_admin:client:refundCreated', source, code, nil)
+        else
+            TriggerClientEvent('cuppa_admin:client:refundCreated', source, nil, 'Database error')
+        end
+    end)
+end)
+
+RegisterNetEvent('cuppa_admin:server:getRefunds', function()
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'refundlist') then
+        TriggerClientEvent('cuppa_admin:client:refundsList', source, {})
+        return
+    end
+    local now = os.time()
+    MySQL.query('SELECT code, admin_name, items, created_at, expires_at FROM refunds WHERE active = 1 AND claimed_by IS NULL AND expires_at > ? ORDER BY created_at DESC', { now }, function(rows)
+        local list = {}
+        if rows then
+            for _, r in ipairs(rows) do
+                local items = json.decode(r.items)
+                local totalItems = 0
+                for _, it in ipairs(items) do totalItems = totalItems + (it.count or 1) end
+                list[#list + 1] = {
+                    code = r.code,
+                    adminName = r.admin_name,
+                    items = items,
+                    totalItems = totalItems,
+                    createdAt = r.created_at,
+                    expiresAt = r.expires_at,
+                    remaining = r.expires_at - now,
+                }
+            end
+        end
+        TriggerClientEvent('cuppa_admin:client:refundsList', source, list)
+    end)
+end)
+
+RegisterNetEvent('cuppa_admin:server:revokeRefund', function(data)
+    local source = source
+    if not source or source == 0 then return end
+    if not hasPermission(source, 'refundlist') then
+        TriggerClientEvent('cuppa_admin:client:refundRevoked', source, 'No permission')
+        return
+    end
+    local code = data.code and data.code:upper() or nil
+    if not code then
+        TriggerClientEvent('cuppa_admin:client:refundRevoked', source, 'No code provided')
+        return
+    end
+    MySQL.update('UPDATE refunds SET active = 0 WHERE code = ? AND active = 1 AND claimed_by IS NULL', { code }, function(affected)
+        if affected and affected > 0 then
+            logAdminAction('Refund Revoked', 'Code: ' .. code, GetPlayerName(source) or 'Console')
+            TriggerClientEvent('cuppa_admin:client:refundRevoked', source, nil)
+        else
+            TriggerClientEvent('cuppa_admin:client:refundRevoked', source, 'Refund not found or already used/expired')
+        end
+    end)
+end)
+
+RegisterNetEvent('cuppa_admin:server:claimRefund', function(code)
+    local source = source
+    if not source or source == 0 then return end
+    if not code or code == '' then
+        TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'Usage: /refund <code>')
+        return
+    end
+    code = code:upper()
+    MySQL.single('SELECT id, items, expires_at, active, claimed_by FROM refunds WHERE code = ?', { code }, function(row)
+        if not row then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'Invalid refund code')
+            return
+        end
+        if not row.active or row.active == 0 then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has been revoked')
+            return
+        end
+        if row.claimed_by then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has already been claimed')
+            return
+        end
+        if row.expires_at < os.time() then
+            MySQL.query.await('UPDATE refunds SET active = 0 WHERE id = ?', { row.id })
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has expired')
+            return
+        end
+        local items = json.decode(row.items)
+        TriggerClientEvent('cuppa_admin:client:refundClaimItems', source, code, row.id, items)
+    end)
+end)
+
+RegisterNetEvent('cuppa_admin:server:confirmClaimRefund', function(data)
+    local source = source
+    if not source or source == 0 then return end
+    local code = data.code
+    local refundId = data.refundId
+    local selectedItems = data.items
+    if not code or not refundId or not selectedItems or #selectedItems == 0 then
+        TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'No items selected')
+        return
+    end
+    MySQL.single('SELECT id, items, expires_at, active, claimed_by FROM refunds WHERE code = ? AND id = ?', { code, refundId }, function(row)
+        if not row then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'Refund not found')
+            return
+        end
+        if not row.active or row.active == 0 then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has been revoked')
+            return
+        end
+        if row.claimed_by then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has already been claimed')
+            return
+        end
+        if row.expires_at < os.time() then
+            MySQL.query.await('UPDATE refunds SET active = 0 WHERE id = ?', { row.id })
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'This refund has expired')
+            return
+        end
+        local allItems = json.decode(row.items)
+        local allowed = {}
+        for _, item in ipairs(allItems) do
+            allowed[item.name] = item
+        end
+        local playerName = GetPlayerName(source) or 'Unknown'
+        local given = {}
+        local failed = {}
+        for _, sel in ipairs(selectedItems) do
+            local template = allowed[sel.name]
+            if template then
+                local count = math.max(1, math.min(MAX_GIVEITEM, sel.count or template.count or 1))
+                local meta = sel.metadata or template.metadata or {}
+                local ok = exports.ox_inventory:AddItem(source, sel.name, count, meta)
+                if ok then
+                    given[#given + 1] = count .. 'x ' .. (template.label or sel.name)
+                else
+                    failed[#failed + 1] = count .. 'x ' .. (template.label or sel.name)
+                end
+            end
+        end
+        if #given == 0 then
+            TriggerClientEvent('cuppa_admin:client:refundClaimed', source, false, 'No items could be given (inventory full?)')
+            return
+        end
+        MySQL.query.await('UPDATE refunds SET active = 0, claimed_by = ?, claimed_at = ? WHERE id = ?', {
+            playerName .. ' (' .. (GetPlayerIdentifierByType(source, 'license') or 'unknown') .. ')',
+            os.time(),
+            row.id,
+        })
+        local msg = 'Claimed: ' .. table.concat(given, ', ')
+        if #failed > 0 then
+            msg = msg .. ' | Failed (inventory full?): ' .. table.concat(failed, ', ')
+        end
+        logAdminAction('Refund Claimed', ('Code: %s | By: %s'):format(code, playerName), 'System')
+        TriggerClientEvent('cuppa_admin:client:refundClaimed', source, true, msg)
+    end)
 end)

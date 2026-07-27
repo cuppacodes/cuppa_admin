@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>cuppa_admin</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="terminal">
+        <div class="resize-handle resize-n" data-dir="n"></div>
+        <div class="resize-handle resize-s" data-dir="s"></div>
+        <div class="resize-handle resize-e" data-dir="e"></div>
+        <div class="resize-handle resize-w" data-dir="w"></div>
+        <div class="resize-handle resize-ne" data-dir="ne"></div>
+        <div class="resize-handle resize-nw" data-dir="nw"></div>
+        <div class="resize-handle resize-se" data-dir="se"></div>
+        <div class="resize-handle resize-sw" data-dir="sw"></div>
+
+        <div id="header">
+            <span class="prompt">CUPPA ADMIN</span>
+            <span class="system">F3 to close</span>
+            <button id="settings-btn" title="Settings">&#9881;</button>
+            <span id="close-btn">&#10005;</span>
+        </div>
+
+        <div id="toolbar">
+            <button data-cmd="stats">Stats</button>
+            <button data-cmd="announce">Announce</button>
+            <div class="toolbar-sep"></div>
+            <button data-cmd="vec2">Vec2</button>
+            <button data-cmd="vec3">Vec3</button>
+            <button data-cmd="vec4">Vec4</button>
+            <button data-cmd="heading">Heading</button>
+            <div class="toolbar-sep"></div>
+            <button data-cmd="names">Names</button>
+            <button data-cmd="blips">Blips</button>
+            <div class="toolbar-sep"></div>
+            <button data-cmd="refund">Refund</button>
+            <button data-cmd="refunds">Refunds</button>
+        </div>
+
+        <div id="main">
+            <div id="left">
+                <div id="output"></div>
+                <div id="input-area">
+                    <span class="prompt">&#10095;</span>
+                    <input id="input" type="text" autocomplete="off" spellcheck="false" autofocus />
+                </div>
+            </div>
+
+            <div id="divider"></div>
+
+            <div id="right">
+                <div id="panel-players">
+                    <div class="section-header">PLAYERS</div>
+                    <div id="player-list"></div>
+                </div>
+
+                <div id="panel-detail" style="display:none;">
+                    <div id="detail-header">
+                        <span id="detail-back">&#8249;</span>
+                        <span id="detail-title">Player</span>
+                    </div>
+                    <div id="detail-info"></div>
+                    <div id="detail-commands"></div>
+                </div>
+
+                <div id="panel-inventory" style="display:none;">
+                    <div id="inv-header">
+                        <span id="inv-back">&#8249;</span>
+                        <span id="inv-title">Inventory</span>
+                        <button id="inv-add-btn">+ Give Item</button>
+                    </div>
+                    <div id="inv-weight"></div>
+                    <div id="inv-list"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="suggestions"></div>
+    </div>
+
+    <div id="modal-overlay" style="display:none;">
+        <div id="modal">
+            <div id="modal-header">
+                <span id="modal-title"></span>
+                <span id="modal-close">&#10005;</span>
+            </div>
+            <div id="modal-body"></div>
+            <div id="modal-footer">
+                <button id="modal-cancel">Cancel</button>
+                <button id="modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="settings-overlay" style="display:none;">
+        <div id="settings-panel">
+            <div class="settings-header">
+                <span>Terminal Settings</span>
+                <span id="settings-close">&#10005;</span>
+            </div>
+            <div class="settings-body">
+                <div class="setting-row">
+                    <label>Accent Color</label>
+                    <input type="color" id="setting-accent" value="#82c8ff">
+                </div>
+                <div class="setting-row">
+                    <label>Background Opacity</label>
+                    <input type="range" id="setting-opacity" min="10" max="95" value="55">
+                    <span class="setting-val" id="opacity-val">75%</span>
+                </div>
+                <div class="setting-row">
+                    <label>Blur Amount</label>
+                    <input type="range" id="setting-blur" min="0" max="40" value="20">
+                    <span class="setting-val" id="blur-val">20px</span>
+                </div>
+                <div class="setting-actions">
+                    <button id="settings-reset">Reset to Default</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

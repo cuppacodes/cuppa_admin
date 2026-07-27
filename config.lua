@@ -45,5 +45,12 @@ return {
         visible = 'admin',
         hide = 'mod',
         bucket = 'mod',
+        terminal = 'mod',
+        inventory = 'mod',
+        dev = 'admin',
+        names = 'mod',
+        blips = 'mod',
+        refund = 'admin',
+        refundlist = 'mod',
     },
 }
